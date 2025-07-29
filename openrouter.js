@@ -32,17 +32,14 @@ function createUserProfile() {
 function extractTextFromMessage(message) {
   if (!message) return null;
 
-  // plain text message
   if (typeof message.conversation === 'string') {
     return message.conversation.trim();
   }
-  
-  // extendedTextMessage (often quoted replies)
+
   if (message.extendedTextMessage?.text) {
     return message.extendedTextMessage.text.trim();
   }
-  
-  // image/video/audio captions
+
   if (message.imageMessage?.caption) {
     return message.imageMessage.caption.trim();
   }
@@ -52,8 +49,7 @@ function extractTextFromMessage(message) {
   if (message.audioMessage?.caption) {
     return message.audioMessage.caption.trim();
   }
-  
-  // fallback if message.text exists
+
   if (message.text) {
     if (typeof message.text === 'string') return message.text.trim();
     if (message.text.body) return message.text.body.trim();
@@ -178,12 +174,46 @@ Recommend a specific online course or learning path that fits their needs. Inclu
   return res.data.choices?.[0]?.message?.content || 'No recommendation available.';
 }
 
-// Main exported function: handles onboarding + recommendations
+// === NEW: Helper to check if message is course-related ===
+function isCourseRelated(msg) {
+  const keywords = [
+    'course', 'learn', 'tutorial', 'study', 'skill', 'programming', 'python', 'java',
+    'javascript', 'data', 'machine learning', 'ml', 'deep learning', 'ai', 'artificial intelligence',
+    'beginner', 'intermediate', 'advanced', 'expert', 'goal', 'interest', 'recommendation'
+  ];
+  msg = msg.toLowerCase();
+  return keywords.some(keyword => msg.includes(keyword));
+}
+
+// === NEW: Generate short polite AI reply for off-topic messages ===
+async function generateShortAIReply(msg) {
+  const systemPrompt = `You are a polite assistant. Reply concisely to this message: "${msg}". Then politely ask the user to ask only course-related questions.`;
+  const res = await axios.post(
+    'https://openrouter.ai/api/v1/chat/completions',
+    {
+      model: 'mistralai/mistral-7b-instruct',
+      messages: [
+        { role: 'system', content: systemPrompt }
+      ],
+      max_tokens: 60,
+      temperature: 0.7
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 10000
+    }
+  );
+  return res.data.choices?.[0]?.message?.content || "Sorry, I can only answer course-related questions.";
+}
+
+// Main exported function: handles onboarding + recommendations + off-topic responses
 async function getAIResponse(userId, rawMessage) {
   try {
     const uid = validateUserId(userId);
 
-    // Extract text content from raw message object if needed
     let messageText = null;
     if (typeof rawMessage === 'string') {
       messageText = rawMessage;
@@ -210,6 +240,17 @@ async function getAIResponse(userId, rawMessage) {
       profile.onboardingStep = ONBOARDING_STEPS.INTERESTS;
       profile.conversationHistory = [];
       return `👋 Hello! I'm your course recommendation assistant.\n\n🎯 What subject or skill are you interested in learning? (e.g., "Python programming")`;
+    }
+
+    // === NEW: Handle random/off-topic messages ===
+    if (!isCourseRelated(messageText)) {
+      // 20% chance to reply with short polite AI response
+      if (Math.random() < 0.2) {
+        const shortReply = await generateShortAIReply(messageText);
+        return shortReply;
+      } else {
+        return "🤖 Please ask questions related to courses or learning topics. Say 'hello' to start.";
+      }
     }
 
     // Onboarding steps

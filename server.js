@@ -69,34 +69,36 @@ sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
 
   sock.ev.on('creds.update', saveCreds);
 
- sock.ev.on('messages.upsert', async ({ messages, type }) => {
+sock.ev.on('messages.upsert', async ({ messages, type }) => {
   const msg = messages[0];
   if (!msg.message || msg.key.fromMe) return;
 
-  const text = extractTextFromMessage(msg.message).trim();
-  if (!text) return; // no valid text to process
+  const isGroup = msg.key.remoteJid.endsWith('@g.us');
+  const groupId = msg.key.remoteJid;
+  const participantId = msg.key.participant; // only in groups
+  const senderId = isGroup ? participantId : msg.key.remoteJid;
+  const conversationKey = isGroup ? `${groupId}_${participantId}` : senderId;
 
-  const sender = msg.key.remoteJid;
-  const isGroup = sender.endsWith('@g.us');
-  const from = isGroup ? msg.pushName || sender : sender;
+  // Extract message text (your extractTextFromMessage function)
+  const text = extractTextFromMessage(msg.message);
+  if (!text) return;
 
-  broadcast({
-    type: 'message',
-    from,
-    text,
-    isGroup
-  });
+  // Call your AI with per-user context key
+  const aiReply = await getAIResponse(conversationKey, text);
 
-  // Pass user ID and message text to your getAIResponse (update signature if needed)
-  const aiReply = await getAIResponse(sender, text);
-
-  await sock.sendMessage(sender, { text: aiReply });
-  broadcast({
-    type: 'reply',
-    to: from,
-    text: aiReply
-  });
+  if (isGroup) {
+    // Mention user in group reply
+    const participantNumber = participantId.split('@')[0];
+    await sock.sendMessage(groupId, {
+      text: `@${participantNumber} ${aiReply}`,
+      mentions: [participantId]
+    });
+  } else {
+    // Private chat reply
+    await sock.sendMessage(senderId, { text: aiReply });
+  }
 });
+
 
 }
 
