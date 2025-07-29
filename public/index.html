@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>WhatsApp Bot QR</title>
+  <meta charset="UTF-8">
+  <style>
+    #qr-container { text-align: center; margin-top: 50px; }
+    #status { font-size: 20px; margin-top: 20px; }
+  </style>
+</head>
+<body>
+  <div id="qr-container">
+    <h2>Scan this QR Code to login</h2>
+    <div id="qr-code"></div>
+    <p id="status">Waiting for QR...</p>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.min.js"></script>
+  <script>
+    const ws = new WebSocket(`ws://${location.host}`);
+
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      if (data.type === 'qr') {
+        document.getElementById('status').innerText = 'Please scan the QR code';
+        QRCode.toDataURL(data.qr)
+          .then(url => {
+            document.getElementById('qr-code').innerHTML = `<img src="${url}" />`;
+          });
+      } else if (data.type === 'status') {
+        document.getElementById('status').innerText = data.status === 'connected'
+          ? '✅ WhatsApp connected!'
+          : '❌ Disconnected... waiting for QR again';
+      }
+    };
+  </script>
+</body>
+</html>
