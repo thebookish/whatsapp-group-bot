@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+<!-- <!DOCTYPE html>
 <html>
 <head>
   <title>WhatsApp Bot QR</title>
@@ -32,6 +32,44 @@
           ? '✅ WhatsApp connected!'
           : '❌ Disconnected... waiting for QR again';
       }
+    };
+  </script>
+</body>
+</html> -->
+<!-- public/index.html -->
+<!DOCTYPE html>
+<html>
+<head>
+  <title>WhatsApp Bot QR</title>
+  <style>
+    body { font-family: Arial; text-align: center; padding-top: 40px; }
+    #qr { margin-top: 20px; }
+  </style>
+</head>
+<body>
+  <h2>Click to Start WhatsApp Bot</h2>
+  <button id="startBtn">Start Bot & Show QR</button>
+  <div id="qr"></div>
+  <p id="status"></p>
+
+  <script>
+    const ws = new WebSocket(`ws://${location.host}`);
+
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      if (data.type === 'qr') {
+        const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(data.qr)}&size=250x250`;
+        document.getElementById('qr').innerHTML = `<img src="${qrUrl}" />`;
+      }
+      if (data.type === 'status') {
+        document.getElementById('status').textContent = `Status: ${data.status}`;
+      }
+    };
+
+    document.getElementById('startBtn').onclick = async () => {
+      const res = await fetch('/start-bot');
+      const result = await res.json();
+      alert(`Bot ${result.status}`);
     };
   </script>
 </body>
