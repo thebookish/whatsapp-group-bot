@@ -1,77 +1,59 @@
 const axios = require('axios');
 
-// Load API keys from env variables or fallback (replace with your keys)
+// === API Key ===
 const OPENROUTER_API_KEY = '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';
-const YOUTUBE_API_KEY = 'AIzaSyA6iFaCEc86hXCB0K6fM_NQyfsYzj7Oez8';
 
-// Onboarding states
+// Onboarding steps
 const ONBOARDING_STEPS = {
-  INTERESTS: 1,
-  GOALS: 2,
-  LEVEL: 3,
+  NAME: 1,
+  INTERESTS: 2,
+  GOALS: 3,
+  COUNTRY: 4,
   COMPLETE: 0
 };
 
-const GREETING_PATTERNS = /(^|\W)(hello|hi|hey|greetings|start|begin)(\W|$)/i;
+const GREETING_PATTERNS = /(^|\W)(hello|hi|hey|start|begin)(\W|$)/i;
 
-// In-memory user prefs (Map is efficient)
+// Store all student profiles and history in memory
 const userPrefs = new Map();
 
 function createUserProfile() {
   return {
+    name: '',
     interests: '',
     goals: '',
-    level: '',
-    onboardingStep: ONBOARDING_STEPS.INTERESTS,
+    country: '',
+    onboardingStep: ONBOARDING_STEPS.NAME,
     lastInteraction: new Date(),
-    conversationHistory: []
+    conversationHistory: [] // stores { message, response, timestamp }
   };
 }
 
-// Extract text from various WhatsApp message types reliably
+// Extract text from WhatsApp message formats
 function extractTextFromMessage(message) {
   if (!message) return null;
 
   if (typeof message.conversation === 'string') {
     return message.conversation.trim();
   }
-
   if (message.extendedTextMessage?.text) {
     return message.extendedTextMessage.text.trim();
   }
-
   if (message.imageMessage?.caption) {
     return message.imageMessage.caption.trim();
   }
   if (message.videoMessage?.caption) {
     return message.videoMessage.caption.trim();
   }
-  if (message.audioMessage?.caption) {
-    return message.audioMessage.caption.trim();
-  }
-
   if (message.text) {
     if (typeof message.text === 'string') return message.text.trim();
     if (message.text.body) return message.text.body.trim();
   }
 
-  return null; // No text found
+  return null;
 }
 
-// Normalize experience level input
-function normalizeExperienceLevel(level) {
-  if (!level) return 'unspecified';
-  const l = level.toLowerCase().trim();
-  const map = {
-    beginner: 'beginner', begin: 'beginner', new: 'beginner', starter: 'beginner', novice: 'beginner',
-    intermediate: 'intermediate', inter: 'intermediate', medium: 'intermediate', mid: 'intermediate',
-    advanced: 'advanced',
-    expert: 'expert', professional: 'expert', pro: 'expert'
-  };
-  return map[l] || l;
-}
-
-// Validate userId string
+// Validate inputs
 function validateUserId(userId) {
   if (!userId || typeof userId !== 'string') {
     throw new Error('Invalid userId');
@@ -79,7 +61,6 @@ function validateUserId(userId) {
   return userId;
 }
 
-// Validate message text
 function validateMessage(msg) {
   if (!msg || typeof msg !== 'string' || !msg.trim()) {
     throw new Error('Empty message');
@@ -90,68 +71,34 @@ function validateMessage(msg) {
   return msg.trim();
 }
 
-// Extract course title from AI response (simple heuristic)
-function extractCourseTitle(aiText) {
-  if (!aiText) return 'online course';
-  const patterns = [
-    /course (on|about|titled|called)?\s*["“]?([a-zA-Z0-9\s\-:]{5,50})["”]?/i,
-    /learn\s+([a-zA-Z0-9\s\-:]{5,50})/i,
-    /study\s+([a-zA-Z0-9\s\-:]{5,50})/i,
-    /"([a-zA-Z0-9\s\-:]{5,50})"/,
-    /\*\*([a-zA-Z0-9\s\-:]{5,50})\*\*/
-  ];
-  for (const pat of patterns) {
-    const m = aiText.match(pat);
-    if (m) return (m[2] || m[1]).trim().replace(/[^\w\s\-:]/g, '');
-  }
-  return aiText.split('\n')[0].slice(0, 50);
-}
+// Generate AI reply based on student profile + conversation history
+async function generateAIResponse(profile, studentMessage) {
+  const historyContext = profile.conversationHistory
+    .map(h => `User: ${h.message}\nAssistant: ${h.response}`)
+    .join('\n');
 
-// Search YouTube videos
-async function searchYouTubeVideo(query, maxResults = 3) {
-  if (!YOUTUBE_API_KEY || YOUTUBE_API_KEY === 'your_youtube_api_key') {
-    return { videos: [], error: 'YouTube API key not set' };
-  }
-  try {
-    const resp = await axios.get('https://www.googleapis.com/youtube/v3/search', {
-      params: {
-        part: 'snippet',
-        q: `${query} tutorial course`,
-        key: YOUTUBE_API_KEY,
-        maxResults,
-        type: 'video',
-        order: 'relevance',
-        videoDuration: 'medium'
-      }
-    });
-    const videos = resp.data.items.map(v => ({
-      title: v.snippet.title,
-      url: `https://www.youtube.com/watch?v=${v.id.videoId}`,
-      channel: v.snippet.channelTitle,
-      description: v.snippet.description.slice(0, 100) + '...'
-    }));
-    return { videos, error: null };
-  } catch (e) {
-    console.error('YouTube API error:', e.response?.data || e.message);
-    return { videos: [], error: 'Failed to fetch YouTube videos' };
-  }
-}
-
-// Call OpenRouter AI for recommendation
-async function generateAIRecommendation(userProfile, userMessage) {
-  if (!OPENROUTER_API_KEY || OPENROUTER_API_KEY === 'your_openrouter_api_key') {
-    throw new Error('OpenRouter API key not set');
-  }
-  const systemPrompt = `You are an expert educational advisor specializing in online course recommendations. Provide specific, actionable course recommendations with clear learning paths. Keep responses concise (2-3 sentences max). Mention platforms like Coursera, Udemy, edX, Khan Academy if possible.`;
-  const userPrompt = `
-User Profile:
-- Interests: ${userProfile.interests}
-- Goals: ${userProfile.goals}
-- Experience Level: ${userProfile.level}
-- Question: "${userMessage}"
-
-Recommend a specific online course or learning path that fits their needs. Include course name and platform if possible.
+  const systemPrompt = `
+You are a helpful Student Assistant.
+You can help with university recommendations, scholarships, study tips, admission guidance, and anything a student needs.
+You have access to the student's past interactions and preferences.
+Always answer the student's question politely and clearly.
+After answering, always add a friendly reminder to ask student-related questions so the assistant can be more helpful.
   `;
+
+  const userPrompt = `
+Student Info:
+- Name: ${profile.name}
+- Interests: ${profile.interests}
+- Goals: ${profile.goals}
+- Country: ${profile.country}
+
+Chat History:
+${historyContext}
+
+Student's Latest Question:
+"${studentMessage}"
+  `;
+
   const res = await axios.post(
     'https://openrouter.ai/api/v1/chat/completions',
     {
@@ -171,45 +118,11 @@ Recommend a specific online course or learning path that fits their needs. Inclu
       timeout: 15000
     }
   );
-  return res.data.choices?.[0]?.message?.content || 'No recommendation available.';
+
+  return res.data.choices?.[0]?.message?.content || "Sorry, I couldn't process your question.";
 }
 
-// === NEW: Helper to check if message is course-related ===
-function isCourseRelated(msg) {
-  const keywords = [
-    'course', 'learn', 'tutorial', 'study', 'skill', 'programming', 'python', 'java',
-    'javascript', 'data', 'machine learning', 'ml', 'deep learning', 'ai', 'artificial intelligence',
-    'beginner', 'intermediate', 'advanced', 'expert', 'goal', 'interest', 'recommendation'
-  ];
-  msg = msg.toLowerCase();
-  return keywords.some(keyword => msg.includes(keyword));
-}
-
-// === NEW: Generate short polite AI reply for off-topic messages ===
-async function generateShortAIReply(msg) {
-  const systemPrompt = `You are a polite assistant. Reply concisely to this message: "${msg}". Then politely ask the user to ask only course-related questions.`;
-  const res = await axios.post(
-    'https://openrouter.ai/api/v1/chat/completions',
-    {
-      model: 'mistralai/mistral-7b-instruct',
-      messages: [
-        { role: 'system', content: systemPrompt }
-      ],
-      max_tokens: 60,
-      temperature: 0.7
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      timeout: 10000
-    }
-  );
-  return res.data.choices?.[0]?.message?.content || "Sorry, I can only answer course-related questions.";
-}
-
-// Main exported function: handles onboarding + recommendations + off-topic responses
+// Main function
 async function getAIResponse(userId, rawMessage) {
   try {
     const uid = validateUserId(userId);
@@ -226,83 +139,57 @@ async function getAIResponse(userId, rawMessage) {
     }
 
     messageText = validateMessage(messageText);
-
     const lowerMsg = messageText.toLowerCase();
 
+    // Create profile if new user
     if (!userPrefs.has(uid)) {
       userPrefs.set(uid, createUserProfile());
     }
     const profile = userPrefs.get(uid);
     profile.lastInteraction = new Date();
 
-    // Handle greeting: restart onboarding
+    // Greeting resets onboarding
     if (GREETING_PATTERNS.test(lowerMsg)) {
-      profile.onboardingStep = ONBOARDING_STEPS.INTERESTS;
+      profile.onboardingStep = ONBOARDING_STEPS.NAME;
       profile.conversationHistory = [];
-      return `👋 Hello! I'm your course recommendation assistant.\n\n🎯 What subject or skill are you interested in learning? (e.g., "Python programming")`;
+      return `👋 Hello! I'm your Student Assistant.\nLet's get started!\n\nWhat's your name?`;
     }
 
-    // === NEW: Handle random/off-topic messages ===
-    if (!isCourseRelated(messageText)) {
-      // 20% chance to reply with short polite AI response
-      if (Math.random() < 0.2) {
-        const shortReply = await generateShortAIReply(messageText);
-        return shortReply;
-      } else {
-        return "🤖 Please ask questions related to courses or learning topics. Say 'hello' to start.";
-      }
-    }
-
-    // Onboarding steps
+    // Onboarding process
     if (profile.onboardingStep !== ONBOARDING_STEPS.COMPLETE) {
       switch (profile.onboardingStep) {
+        case ONBOARDING_STEPS.NAME:
+          profile.name = messageText;
+          profile.onboardingStep = ONBOARDING_STEPS.INTERESTS;
+          return `Nice to meet you, ${profile.name}! 🎓\nWhat subjects or fields are you interested in?`;
         case ONBOARDING_STEPS.INTERESTS:
           profile.interests = messageText;
           profile.onboardingStep = ONBOARDING_STEPS.GOALS;
-          return `Great! ${messageText} is a valuable skill.\n\n🎯 What's your main learning goal?\n• Get a job\n• Build a project\n• Advance career\n• Hobby\n• Academic requirement`;
+          return `Got it! What are your main study or career goals? (e.g., scholarship, admission, job)`;
         case ONBOARDING_STEPS.GOALS:
           profile.goals = messageText;
-          profile.onboardingStep = ONBOARDING_STEPS.LEVEL;
-          return `Perfect! Now, what's your current experience level with ${profile.interests}?\n• Beginner\n• Intermediate\n• Advanced\n• Expert`;
-        case ONBOARDING_STEPS.LEVEL:
-          profile.level = normalizeExperienceLevel(messageText);
+          profile.onboardingStep = ONBOARDING_STEPS.COUNTRY;
+          return `Great! Which country are you currently in or planning to study in?`;
+        case ONBOARDING_STEPS.COUNTRY:
+          profile.country = messageText;
           profile.onboardingStep = ONBOARDING_STEPS.COMPLETE;
-          return `✅ Profile saved:\n• Interest: ${profile.interests}\n• Goal: ${profile.goals}\n• Level: ${profile.level}\n\nYou can now ask me for course recommendations!`;
+          return `✅ Profile saved!\nName: ${profile.name}\nInterests: ${profile.interests}\nGoals: ${profile.goals}\nCountry: ${profile.country}\n\nYou can now ask me anything related to your studies!`;
       }
     }
 
-    // Post-onboarding: Generate recommendation
-    if (profile.onboardingStep === ONBOARDING_STEPS.COMPLETE) {
-      if (!profile.interests) {
-        return "Please start by saying 'hello' to set your preferences.";
-      }
+    // If onboarding is complete → answer question
+    const aiReply = await generateAIResponse(profile, messageText);
 
-      const aiResponse = await generateAIRecommendation(profile, messageText);
-      const courseTitle = extractCourseTitle(aiResponse);
+    // Save chat history
+    profile.conversationHistory.push({
+      message: messageText,
+      response: aiReply,
+      timestamp: new Date()
+    });
+    if (profile.conversationHistory.length > 20) profile.conversationHistory.shift();
 
-      const { videos, error: ytError } = await searchYouTubeVideo(courseTitle);
+    return aiReply;
 
-      let reply = `🎓 Course Recommendation:\n${aiResponse}\n\n`;
-
-      if (videos.length) {
-        reply += `🎥 Related YouTube videos:\n`;
-        videos.slice(0, 2).forEach((v, i) => {
-          reply += `${i + 1}. [${v.title}](${v.url}) by ${v.channel}\n`;
-        });
-      } else if (ytError) {
-        reply += `🎥 YouTube videos: ${ytError}\n`;
-      }
-
-      reply += `\n💡 Ask for more recommendations or say 'hello' to update preferences.`;
-
-      // Save to conversation history (limit 5)
-      profile.conversationHistory.push({ message: messageText, response: reply, timestamp: new Date() });
-      if (profile.conversationHistory.length > 5) profile.conversationHistory.shift();
-
-      return reply;
-    }
-
-    return "Say 'hello' to get started!";
   } catch (error) {
     console.error('getAIResponse error:', error.message);
     if (error.message.includes('Invalid userId')) return "❌ Invalid user ID.";
@@ -312,7 +199,7 @@ async function getAIResponse(userId, rawMessage) {
   }
 }
 
-// Optional utilities to clear user data or get stats
+// Utilities
 function clearUserData(userId) {
   try {
     const uid = validateUserId(userId);
