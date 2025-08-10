@@ -1,5 +1,4 @@
 // server.js
-require('dotenv').config();
 const express = require('express');
 const path = require('path');
 const {
@@ -12,12 +11,12 @@ const { WebSocketServer } = require('ws');
 const qrcode = require('qrcode-terminal');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = 3000;
 const AUTH_DIR = 'auth_info_baileys';
-const KEEP_ALIVE_MS = Number(process.env.KEEP_ALIVE_MS || 10000);
+const KEEP_ALIVE_MS = Number( 10000);
 
 // Keyword trigger(s) for group chats (comma separated in env) e.g. "@bot,bot"
-const triggers = (process.env.KEYWORD_TRIGGER || '@bot,bot')
+const triggers = ('@bot,bot')
   .split(',')
   .map(t => t.trim().toLowerCase())
   .filter(Boolean);
@@ -89,12 +88,12 @@ async function startBot() {
     sock.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect, qr } = update;
 
-      if (qr) {
-        // optional: show QR in terminal too for manual scanning
-        try { qrcode.generate(qr, { small: true }); } catch {}
-        broadcast({ type: 'qr', qr });
-        console.log('📷 New QR generated, sent to frontend.');
-      }
+      // if (qr) {
+      //   // optional: show QR in terminal too for manual scanning
+      //   try { qrcode.generate(qr, { small: true }); } catch {}
+      //   broadcast({ type: 'qr', qr });
+      //   console.log('📷 New QR generated, sent to frontend.');
+      // }
 
       if (connection === 'open') {
         console.log('✅ WhatsApp connected');
