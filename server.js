@@ -88,12 +88,12 @@ async function startBot() {
     sock.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect, qr } = update;
 
-      // if (qr) {
-      //   // optional: show QR in terminal too for manual scanning
-      //   try { qrcode.generate(qr, { small: true }); } catch {}
-      //   broadcast({ type: 'qr', qr });
-      //   console.log('📷 New QR generated, sent to frontend.');
-      // }
+      if (qr) {
+        // optional: show QR in terminal too for manual scanning
+        // try { qrcode.generate(qr, { small: true }); } catch {}
+        broadcast({ type: 'qr', qr });
+        console.log('📷 New QR generated, sent to frontend.');
+      }
 
       if (connection === 'open') {
         console.log('✅ WhatsApp connected');
