@@ -34,7 +34,6 @@ let saveCreds = null;
 let isStarting = false;
 let shouldStop = false;
 
-// Track last activity for watchdog
 let lastMessageTimestamp = Date.now();
 
 function extractTextFromMessage(message) {
@@ -59,7 +58,15 @@ async function startBot() {
     saveCreds = _saveCreds;
 
     if (sock) {
-      try { await sock.logout(); } catch {}
+      try {
+        if (sock.ws && sock.ws.readyState === 1) {
+          await sock.end();
+        }
+      } catch (err) {
+        if (!/WebSocket was closed before the connection/.test(String(err))) {
+          console.error('Error ending socket:', err);
+        }
+      }
       sock = null;
     }
 
@@ -91,14 +98,16 @@ async function startBot() {
           isStarting = false;
           if (!shouldStop) startBot();
         }, 2000);
+      } else if (connection === 'connecting') {
+        console.log('🔄 WhatsApp connecting...');
+        broadcast({ type: 'status', status: 'connecting' });
       }
     });
 
     sock.ev.on('creds.update', saveCreds);
 
+    // Message handling
     sock.ev.on('messages.upsert', async ({ messages }) => {
-      lastMessageTimestamp = Date.now(); // update activity timestamp
-
       try {
         if (!messages?.[0] || messages[0].key.fromMe) return;
         const msg = messages[0];
@@ -123,23 +132,18 @@ async function startBot() {
 
         if (!text?.trim()) return;
         text = text.trim();
+        lastMessageTimestamp = Date.now();
 
         let sendPrivately = false;
         if (isGroup) {
           const mentionedJids = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
           const botJid = sock?.user?.id;
-          const botNumber = botJid?.split('@')[0];
-
-          // Check if bot is mentioned either via WhatsApp mention or by @name in plain text
-          const isMentioned = mentionedJids.includes(botJid) ||
-            new RegExp(`@${botNumber}\\b`, 'i').test(text);
-
+          const isMentioned = mentionedJids.includes(botJid);
           if (!isMentioned) return;
 
-          // Remove the mention text
-          text = text.replace(new RegExp(`@${botNumber}`, 'gi'), '').trim();
+          const botNumber = sock?.user?.id?.split('@')[0];
+          text = text.replace(new RegExp(`@${botNumber}`, 'g'), '').trim();
 
-          // Check for private reply keywords
           if (/reply\s+me\s+privately|dm\s+me|private\s+reply/i.test(text)) {
             sendPrivately = true;
             text = text.replace(/reply\s+me\s+privately|dm\s+me|private\s+reply/gi, '').trim();
@@ -153,8 +157,9 @@ async function startBot() {
           if (sendPrivately) {
             await sock.sendMessage(senderId, { text: aiReply });
           } else {
+            const participantNumber = participantId.split('@')[0];
             await sock.sendMessage(groupId, {
-              text: `@${participantId.split('@')[0]} ${aiReply}`,
+              text: `@${participantNumber} ${aiReply}`,
               mentions: [participantId]
             });
           }
@@ -170,19 +175,33 @@ async function startBot() {
       }
     });
 
-    // Heartbeat watchdog
+    // Heartbeat watchdog to keep socket alive and reconnect after idle
     setInterval(async () => {
       const now = Date.now();
 
-      if (now - lastMessageTimestamp > 120000) { // 2 min idle
+      // If no message in last 2 mins, reconnect
+      if (now - lastMessageTimestamp > 120000) {
         console.warn('⚠ No activity for 2 minutes — reconnecting...');
-        try { await sock?.end?.(); } catch {}
+        try {
+          if (sock?.ws && sock.ws.readyState === 1) {
+            await sock.end();
+          } else {
+            console.warn('⚠ Socket not open, skipping end().');
+          }
+        } catch (err) {
+          if (!/WebSocket was closed before the connection/.test(String(err))) {
+            console.error('Error ending socket:', err);
+          }
+        }
         startBot();
         return;
       }
 
       try {
-        await sock?.presenceSubscribe?.(sock?.user?.id);
+        // ping to keep connection alive
+        if (sock?.ws && sock.ws.readyState === 1) {
+          sock.ws.ping();
+        }
       } catch (err) {
         console.error('⚠ Heartbeat failed:', err);
       }
@@ -206,7 +225,11 @@ process.on('SIGINT', async () => {
   console.log('\n👋 Shutting down...');
   shouldStop = true;
   try {
-    if (sock) await sock.logout();
+    if (sock) {
+      if (sock.ws && sock.ws.readyState === 1) {
+        await sock.end();
+      }
+    }
   } catch {}
   server.close(() => process.exit(0));
 });
