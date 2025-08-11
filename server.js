@@ -122,21 +122,28 @@ async function startBot() {
         text = text.trim();
 
         let sendPrivately = false;
-        if (isGroup) {
-          const mentionedJids = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
-          const botJid = sock?.user?.id;
-          const isMentioned = mentionedJids.includes(botJid);
-          if (!isMentioned) return;
+if (isGroup) {
+  const mentionedJids = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+  const botJid = sock?.user?.id;
+  const botNumber = botJid?.split('@')[0];
 
-          const botNumber = sock?.user?.id?.split('@')[0];
-          text = text.replace(new RegExp(`@${botNumber}`, 'g'), '').trim();
+  // Detect if bot is truly mentioned
+  const isMentioned = mentionedJids.includes(botJid);
 
-          if (/reply\s+me\s+privately|dm\s+me|private\s+reply/i.test(text)) {
-            sendPrivately = true;
-            text = text.replace(/reply\s+me\s+privately|dm\s+me|private\s+reply/gi, '').trim();
-          }
-          if (!text) return;
-        }
+  if (!isMentioned) return; // Ignore group messages unless bot is tagged
+
+  // Remove the mention from text before sending to AI
+  text = text.replace(new RegExp(`@${botNumber}\\b`, 'gi'), '').trim();
+
+  // Private reply trigger
+  if (/reply\s+me\s+privately|dm\s+me|private\s+reply/i.test(text)) {
+    sendPrivately = true;
+    text = text.replace(/reply\s+me\s+privately|dm\s+me|private\s+reply/gi, '').trim();
+  }
+  
+  if (!text) return;
+}
+
 
         const aiReply = await getAIResponse(conversationKey, text);
 
