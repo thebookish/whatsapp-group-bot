@@ -8,7 +8,6 @@ const {
 } = require('@whiskeysockets/baileys');
 const { getAIResponse } = require('./openrouter');
 const { WebSocketServer } = require('ws');
-const qrcode = require('qrcode-terminal');
 
 const app = express();
 const PORT = 3000;
@@ -34,6 +33,9 @@ let sock = null;
 let saveCreds = null;
 let isStarting = false;
 let shouldStop = false;
+
+// Track last activity for watchdog
+let lastMessageTimestamp = Date.now();
 
 function extractTextFromMessage(message) {
   if (!message) return '';
@@ -94,8 +96,9 @@ async function startBot() {
 
     sock.ev.on('creds.update', saveCreds);
 
-    // Message handling
     sock.ev.on('messages.upsert', async ({ messages }) => {
+      lastMessageTimestamp = Date.now(); // update activity timestamp
+
       try {
         if (!messages?.[0] || messages[0].key.fromMe) return;
         const msg = messages[0];
@@ -122,28 +125,27 @@ async function startBot() {
         text = text.trim();
 
         let sendPrivately = false;
-if (isGroup) {
-  const mentionedJids = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
-  const botJid = sock?.user?.id;
-  const botNumber = botJid?.split('@')[0];
+        if (isGroup) {
+          const mentionedJids = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+          const botJid = sock?.user?.id;
+          const botNumber = botJid?.split('@')[0];
 
-  // Detect if bot is truly mentioned
-  const isMentioned = mentionedJids.includes(botJid);
+          // Check if bot is mentioned either via WhatsApp mention or by @name in plain text
+          const isMentioned = mentionedJids.includes(botJid) ||
+            new RegExp(`@${botNumber}\\b`, 'i').test(text);
 
-  if (!isMentioned) return; // Ignore group messages unless bot is tagged
+          if (!isMentioned) return;
 
-  // Remove the mention from text before sending to AI
-  text = text.replace(new RegExp(`@${botNumber}\\b`, 'gi'), '').trim();
+          // Remove the mention text
+          text = text.replace(new RegExp(`@${botNumber}`, 'gi'), '').trim();
 
-  // Private reply trigger
-  if (/reply\s+me\s+privately|dm\s+me|private\s+reply/i.test(text)) {
-    sendPrivately = true;
-    text = text.replace(/reply\s+me\s+privately|dm\s+me|private\s+reply/gi, '').trim();
-  }
-  
-  if (!text) return;
-}
-
+          // Check for private reply keywords
+          if (/reply\s+me\s+privately|dm\s+me|private\s+reply/i.test(text)) {
+            sendPrivately = true;
+            text = text.replace(/reply\s+me\s+privately|dm\s+me|private\s+reply/gi, '').trim();
+          }
+          if (!text) return;
+        }
 
         const aiReply = await getAIResponse(conversationKey, text);
 
@@ -151,9 +153,8 @@ if (isGroup) {
           if (sendPrivately) {
             await sock.sendMessage(senderId, { text: aiReply });
           } else {
-            const participantNumber = participantId.split('@')[0];
             await sock.sendMessage(groupId, {
-              text: `@${participantNumber} ${aiReply}`,
+              text: `@${participantId.split('@')[0]} ${aiReply}`,
               mentions: [participantId]
             });
           }
@@ -169,12 +170,23 @@ if (isGroup) {
       }
     });
 
-    // Keep connection alive
-    setInterval(() => {
+    // Heartbeat watchdog
+    setInterval(async () => {
+      const now = Date.now();
+
+      if (now - lastMessageTimestamp > 120000) { // 2 min idle
+        console.warn('⚠ No activity for 2 minutes — reconnecting...');
+        try { await sock?.end?.(); } catch {}
+        startBot();
+        return;
+      }
+
       try {
-        if (sock?.ws?.readyState === 1) sock.ws.ping();
-      } catch {}
-    }, Math.max(5000, KEEP_ALIVE_MS));
+        await sock?.presenceSubscribe?.(sock?.user?.id);
+      } catch (err) {
+        console.error('⚠ Heartbeat failed:', err);
+      }
+    }, 20000);
 
     console.log('Bot started.');
   } catch (err) {
