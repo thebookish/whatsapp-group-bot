@@ -131,75 +131,64 @@ async function startBot() {
     sock.ev.on('creds.update', saveCreds);
 
     // messages handler
-    sock.ev.on('messages.upsert', async ({ messages }) => {
-      try {
-        if (!messages || !messages[0]) return;
-        const msg = messages[0];
+sock.ev.on('messages.upsert', async ({ messages }) => {
+  try {
+    if (!messages || !messages[0]) return;
+    const msg = messages[0];
 
-        // Only handle normal incoming messages
-        if (!msg.message || msg.key.fromMe) return;
+    // Ignore messages from self or without content
+    if (!msg.message || msg.key.fromMe) return;
 
-        const remoteJid = msg.key.remoteJid || '';
-        const isGroup = remoteJid.endsWith('@g.us');
-        const groupId = isGroup ? remoteJid : null;
-        const participantId = msg.key.participant; // only for groups
-        const senderId = isGroup ? participantId : msg.key.remoteJid; // final recipient to reply
-        const conversationKey = isGroup ? `${groupId}_${participantId}` : senderId;
+    const remoteJid = msg.key.remoteJid || '';
+    const isGroup = remoteJid.endsWith('@g.us');
+    const groupId = isGroup ? remoteJid : null;
+    const participantId = msg.key.participant; // only for groups
+    const senderId = isGroup ? participantId : msg.key.remoteJid; // DM if not group
+    const conversationKey = isGroup ? `${groupId}_${participantId}` : senderId;
 
-        let text = extractTextFromMessage(msg.message);
-        if (!text || !text.trim()) return;
-        text = text.trim();
+    let text = extractTextFromMessage(msg.message);
+    if (!text || !text.trim()) return;
+    text = text.trim();
 
-        // If it's a group, check for trigger keywords
-        if (isGroup) {
-          const lower = text.toLowerCase();
-          const containsTrigger = triggers.some(t => {
-            if (!t) return false;
-            // check whole word or prefix; also allow '@' mention forms
-            return lower.includes(t);
-          });
-          if (!containsTrigger) {
-            // ignore group chatter without trigger
-            return;
-          }
+    if (isGroup) {
+      // Check if bot was mentioned in this group message
+      const mentionedJids = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+      const botNumber = sock?.user?.id?.split('@')[0]; // bot's number
+      const botJid = sock?.user?.id; // full jid
 
-          // remove trigger from text (first occurrence) so AI sees the clean prompt
-          for (const t of triggers) {
-            const idx = text.toLowerCase().indexOf(t);
-            if (idx !== -1) {
-              // remove that slice
-              text = (text.slice(0, idx) + text.slice(idx + t.length)).trim();
-              break;
-            }
-          }
-          if (!text) {
-            // If nothing left after removing trigger, do not call AI
-            return;
-          }
-        }
-
-        // Call AI
-        try {
-          const aiReply = await getAIResponse(conversationKey, text);
-
-          if (isGroup) {
-            // mention the participant in group reply
-            // participantId is full jid like 12345@s.whatsapp.net
-            const participantNumber = participantId.split('@')[0];
-            await sock.sendMessage(groupId, {
-              text: `@${participantNumber} ${aiReply}`,
-              mentions: [participantId]
-            });
-          } else {
-            await sock.sendMessage(senderId, { text: aiReply });
-          }
-        } catch (err) {
-          console.error('❌ Error while getting AI reply:', err);
-        }
-      } catch (err) {
-        console.error('messages.upsert handler error:', err);
+      const isMentioned = mentionedJids.includes(botJid);
+      if (!isMentioned) {
+        // Ignore group message if bot not mentioned
+        return;
       }
-    });
+
+      // Remove the mention text so AI sees clean prompt
+      text = text.replace(new RegExp(`@${botNumber}`, 'g'), '').trim();
+      if (!text) return;
+    }
+
+    // Call AI
+    try {
+      const aiReply = await getAIResponse(conversationKey, text);
+
+      if (isGroup) {
+        const participantNumber = participantId.split('@')[0];
+        await sock.sendMessage(groupId, {
+          text: `@${participantNumber} ${aiReply}`,
+          mentions: [participantId]
+        });
+      } else {
+        await sock.sendMessage(senderId, { text: aiReply });
+      }
+    } catch (err) {
+      console.error('❌ Error while getting AI reply:', err);
+    }
+
+  } catch (err) {
+    console.error('messages.upsert handler error:', err);
+  }
+});
+
 
     // extra keepalive ping — optional
     setInterval(() => {
