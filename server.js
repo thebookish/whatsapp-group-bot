@@ -13,25 +13,15 @@ const qrcode = require('qrcode-terminal');
 const app = express();
 const PORT = 3000;
 const AUTH_DIR = 'auth_info_baileys';
-const KEEP_ALIVE_MS = Number( 10000);
+const KEEP_ALIVE_MS = 10000;
 
-// Keyword trigger(s) for group chats (comma separated in env) e.g. "@bot,bot"
-const triggers = ('@bot,bot')
-  .split(',')
-  .map(t => t.trim().toLowerCase())
-  .filter(Boolean);
-
-// Serve frontend static (if any)
 app.use(express.static(path.join(__dirname, 'public')));
-
-// Simple health endpoint
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 const server = app.listen(PORT, () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);
 });
 
-// Setup websocket for sending QR/status to frontend (optional)
 const wss = new WebSocketServer({ server });
 function broadcast(data) {
   const str = JSON.stringify(data);
@@ -53,156 +43,135 @@ function extractTextFromMessage(message) {
   if (typeof message.videoMessage?.caption === 'string') return message.videoMessage.caption;
   if (typeof message.buttonsResponseMessage?.selectedButtonId === 'string') return message.buttonsResponseMessage.selectedButtonId;
   if (typeof message.listResponseMessage?.singleSelectReply?.selectedRowId === 'string') return message.listResponseMessage.singleSelectReply.selectedRowId;
-  // default fallbacks
   if (message?.text?.body) return message.text.body;
   return '';
 }
 
 async function startBot() {
-  if (isStarting) {
-    console.log('startBot called but already starting — ignoring duplicate call.');
-    return;
-  }
+  if (isStarting) return;
   isStarting = true;
-  console.log('🔧 Starting WhatsApp bot...');
 
   try {
     const stateRes = await useMultiFileAuthState(AUTH_DIR);
     const { state, saveCreds: _saveCreds } = stateRes;
     saveCreds = _saveCreds;
 
-    // close previous socket if exists
     if (sock) {
-      try { await sock.logout(); } catch (e) { /* ignore */ }
+      try { await sock.logout(); } catch {}
       sock = null;
     }
 
     sock = makeWASocket({
       auth: state,
-      printQRInTerminal: false, // we will handle QR ourselves
+      printQRInTerminal: false,
       keepAliveIntervalMs: KEEP_ALIVE_MS,
-      // optional: add additional options per Baileys docs
     });
 
-    // When QR comes in, broadcast it (frontend can render it)
     sock.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        // optional: show QR in terminal too for manual scanning
-        // try { qrcode.generate(qr, { small: true }); } catch {}
         broadcast({ type: 'qr', qr });
-        console.log('📷 New QR generated, sent to frontend.');
+        console.log('📷 New QR generated.');
       }
 
       if (connection === 'open') {
         console.log('✅ WhatsApp connected');
         broadcast({ type: 'status', status: 'connected' });
-      } else if (connection === 'connecting') {
-        console.log('🔄 WhatsApp connecting...');
-        broadcast({ type: 'status', status: 'connecting' });
       } else if (connection === 'close') {
         const reason = lastDisconnect?.error?.output?.statusCode;
         const isLoggedOut = reason === DisconnectReason.loggedOut;
-        console.log('🔌 Connection closed. Reason:', reason, 'loggedOut:', isLoggedOut);
+
+        console.log('🔌 Connection closed.', reason, 'loggedOut:', isLoggedOut);
         broadcast({ type: 'status', status: 'disconnected', reason });
 
-        // If logged out, we must re-authenticate (QR)
-        if (isLoggedOut) {
-          console.log('❌ Session logged out. You will need to re-authenticate (remove auth_info_baileys to reset).');
-          // Don't auto-restart if logged out. Let user scan QR.
-          // But still try to restart to allow reauth flow
-          setTimeout(() => {
-            isStarting = false;
-            startBot();
-          }, 2000);
+        setTimeout(() => {
+          isStarting = false;
+          if (!shouldStop) startBot();
+        }, 2000);
+      }
+    });
+
+    sock.ev.on('creds.update', saveCreds);
+
+    // Message handling
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+      try {
+        if (!messages?.[0] || messages[0].key.fromMe) return;
+        const msg = messages[0];
+        const remoteJid = msg.key.remoteJid || '';
+        const isGroup = remoteJid.endsWith('@g.us');
+        const groupId = isGroup ? remoteJid : null;
+        const participantId = msg.key.participant || remoteJid;
+        const senderId = isGroup ? participantId : remoteJid;
+        const conversationKey = isGroup ? `${groupId}_${participantId}` : senderId;
+
+        let text;
+        try {
+          text = extractTextFromMessage(msg.message);
+        } catch (err) {
+          if (String(err).includes('No session record')) {
+            console.warn('⚠ Skipping undecryptable message (No session record). Requesting retry...');
+            await sock.sendMessage(senderId, { text: 'Please resend your message, I could not decrypt it.' });
+            return;
+          }
+          throw err;
+        }
+
+        if (!text?.trim()) return;
+        text = text.trim();
+
+        let sendPrivately = false;
+        if (isGroup) {
+          const mentionedJids = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+          const botJid = sock?.user?.id;
+          const isMentioned = mentionedJids.includes(botJid);
+          if (!isMentioned) return;
+
+          const botNumber = sock?.user?.id?.split('@')[0];
+          text = text.replace(new RegExp(`@${botNumber}`, 'g'), '').trim();
+
+          if (/reply\s+me\s+privately|dm\s+me|private\s+reply/i.test(text)) {
+            sendPrivately = true;
+            text = text.replace(/reply\s+me\s+privately|dm\s+me|private\s+reply/gi, '').trim();
+          }
+          if (!text) return;
+        }
+
+        const aiReply = await getAIResponse(conversationKey, text);
+
+        if (isGroup) {
+          if (sendPrivately) {
+            await sock.sendMessage(senderId, { text: aiReply });
+          } else {
+            const participantNumber = participantId.split('@')[0];
+            await sock.sendMessage(groupId, {
+              text: `@${participantNumber} ${aiReply}`,
+              mentions: [participantId]
+            });
+          }
         } else {
-          // Attempt reconnect after short delay
-          console.log('🔄 Attempting reconnect in 2s...');
-          setTimeout(() => {
-            isStarting = false;
-            if (!shouldStop) startBot();
-          }, 2000);
+          await sock.sendMessage(senderId, { text: aiReply });
+        }
+      } catch (err) {
+        if (String(err).includes('No session record')) {
+          console.warn('⚠ Missing session key — ignoring message.');
+        } else {
+          console.error('messages.upsert error:', err);
         }
       }
     });
 
-    // save credentials whenever updated
-    sock.ev.on('creds.update', saveCreds);
-
-    // messages handler
-sock.ev.on('messages.upsert', async ({ messages }) => {
-  try {
-    if (!messages || !messages[0]) return;
-    const msg = messages[0];
-
-    // Ignore messages from self or without content
-    if (!msg.message || msg.key.fromMe) return;
-
-    const remoteJid = msg.key.remoteJid || '';
-    const isGroup = remoteJid.endsWith('@g.us');
-    const groupId = isGroup ? remoteJid : null;
-    const participantId = msg.key.participant; // only for groups
-    const senderId = isGroup ? participantId : msg.key.remoteJid; // DM if not group
-    const conversationKey = isGroup ? `${groupId}_${participantId}` : senderId;
-
-    let text = extractTextFromMessage(msg.message);
-    if (!text || !text.trim()) return;
-    text = text.trim();
-
-    if (isGroup) {
-      // Check if bot was mentioned in this group message
-      const mentionedJids = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
-      const botNumber = sock?.user?.id?.split('@')[0]; // bot's number
-      const botJid = sock?.user?.id; // full jid
-
-      const isMentioned = mentionedJids.includes(botJid);
-      if (!isMentioned) {
-        // Ignore group message if bot not mentioned
-        return;
-      }
-
-      // Remove the mention text so AI sees clean prompt
-      text = text.replace(new RegExp(`@${botNumber}`, 'g'), '').trim();
-      if (!text) return;
-    }
-
-    // Call AI
-    try {
-      const aiReply = await getAIResponse(conversationKey, text);
-
-      if (isGroup) {
-        const participantNumber = participantId.split('@')[0];
-        await sock.sendMessage(groupId, {
-          text: `@${participantNumber} ${aiReply}`,
-          mentions: [participantId]
-        });
-      } else {
-        await sock.sendMessage(senderId, { text: aiReply });
-      }
-    } catch (err) {
-      console.error('❌ Error while getting AI reply:', err);
-    }
-
-  } catch (err) {
-    console.error('messages.upsert handler error:', err);
-  }
-});
-
-
-    // extra keepalive ping — optional
+    // Keep connection alive
     setInterval(() => {
       try {
-        if (sock?.ws && sock.ws.readyState === 1) {
-          sock.ws.ping();
-        }
-      } catch (e) { /* ignore */ }
+        if (sock?.ws?.readyState === 1) sock.ws.ping();
+      } catch {}
     }, Math.max(5000, KEEP_ALIVE_MS));
 
     console.log('Bot started.');
   } catch (err) {
     console.error('startBot error:', err);
-    // try to restart after delay
     setTimeout(() => {
       isStarting = false;
       if (!shouldStop) startBot();
@@ -212,20 +181,13 @@ sock.ev.on('messages.upsert', async ({ messages }) => {
   }
 }
 
-// Start once
 startBot();
 
-// Graceful shutdown
 process.on('SIGINT', async () => {
   console.log('\n👋 Shutting down...');
   shouldStop = true;
   try {
-    if (sock) {
-      try { await sock.logout(); } catch (e) { /* ignore */ }
-      sock = null;
-    }
-  } catch (e) { /* ignore */ }
-  server.close(() => {
-    process.exit(0);
-  });
+    if (sock) await sock.logout();
+  } catch {}
+  server.close(() => process.exit(0));
 });
