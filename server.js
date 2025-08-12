@@ -13,6 +13,7 @@ const app = express();
 const PORT = 3000;
 const AUTH_DIR = 'auth_info_baileys';
 const KEEP_ALIVE_MS = 10000;
+const TRIGGER_KEYWORD = 'heybot'; // change trigger word here
 
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('/health', (req, res) => res.json({ ok: true }));
@@ -33,7 +34,6 @@ let sock = null;
 let saveCreds = null;
 let isStarting = false;
 let shouldStop = false;
-
 let lastMessageTimestamp = Date.now();
 
 function extractTextFromMessage(message) {
@@ -62,11 +62,7 @@ async function startBot() {
         if (sock.ws && sock.ws.readyState === 1) {
           await sock.end();
         }
-      } catch (err) {
-        if (!/WebSocket was closed before the connection/.test(String(err))) {
-          console.error('Error ending socket:', err);
-        }
-      }
+      } catch {}
       sock = null;
     }
 
@@ -94,10 +90,14 @@ async function startBot() {
         console.log('🔌 Connection closed.', reason, 'loggedOut:', isLoggedOut);
         broadcast({ type: 'status', status: 'disconnected', reason });
 
-        setTimeout(() => {
-          isStarting = false;
-          if (!shouldStop) startBot();
-        }, 2000);
+        if (!isLoggedOut) {
+          setTimeout(() => {
+            isStarting = false;
+            if (!shouldStop) startBot();
+          }, 2000);
+        } else {
+          console.log('❌ Logged out — restart with new QR.');
+        }
       } else if (connection === 'connecting') {
         console.log('🔄 WhatsApp connecting...');
         broadcast({ type: 'status', status: 'connecting' });
@@ -106,7 +106,7 @@ async function startBot() {
 
     sock.ev.on('creds.update', saveCreds);
 
-    // Message handling
+    // Handle messages
     sock.ev.on('messages.upsert', async ({ messages }) => {
       try {
         if (!messages?.[0] || messages[0].key.fromMe) return;
@@ -118,31 +118,19 @@ async function startBot() {
         const senderId = isGroup ? participantId : remoteJid;
         const conversationKey = isGroup ? `${groupId}_${participantId}` : senderId;
 
-        let text;
-        try {
-          text = extractTextFromMessage(msg.message);
-        } catch (err) {
-          if (String(err).includes('No session record')) {
-            console.warn('⚠ Skipping undecryptable message (No session record). Requesting retry...');
-            await sock.sendMessage(senderId, { text: 'Please resend your message, I could not decrypt it.' });
-            return;
-          }
-          throw err;
-        }
-
+        let text = extractTextFromMessage(msg.message);
         if (!text?.trim()) return;
         text = text.trim();
         lastMessageTimestamp = Date.now();
 
         let sendPrivately = false;
-        if (isGroup) {
-          const mentionedJids = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
-          const botJid = sock?.user?.id;
-          const isMentioned = mentionedJids.includes(botJid);
-          if (!isMentioned) return;
 
-          const botNumber = sock?.user?.id?.split('@')[0];
-          text = text.replace(new RegExp(`@${botNumber}`, 'g'), '').trim();
+        if (isGroup) {
+          // Only respond if trigger keyword is in message
+          if (!text.toLowerCase().startsWith(TRIGGER_KEYWORD.toLowerCase())) return;
+
+          // Remove trigger keyword from text
+          text = text.slice(TRIGGER_KEYWORD.length).trim();
 
           if (/reply\s+me\s+privately|dm\s+me|private\s+reply/i.test(text)) {
             sendPrivately = true;
@@ -157,54 +145,36 @@ async function startBot() {
           if (sendPrivately) {
             await sock.sendMessage(senderId, { text: aiReply });
           } else {
-            const participantNumber = participantId.split('@')[0];
-            await sock.sendMessage(groupId, {
-              text: `@${participantNumber} ${aiReply}`,
-              mentions: [participantId]
-            });
+            await sock.sendMessage(groupId, { text: aiReply });
           }
         } else {
           await sock.sendMessage(senderId, { text: aiReply });
         }
       } catch (err) {
-        if (String(err).includes('No session record')) {
-          console.warn('⚠ Missing session key — ignoring message.');
-        } else {
-          console.error('messages.upsert error:', err);
-        }
+        console.error('messages.upsert error:', err);
       }
     });
 
-    // Heartbeat watchdog to keep socket alive and reconnect after idle
+    // Heartbeat watchdog
     setInterval(async () => {
       const now = Date.now();
 
-      // If no message in last 2 mins, reconnect
       if (now - lastMessageTimestamp > 120000) {
         console.warn('⚠ No activity for 2 minutes — reconnecting...');
         try {
           if (sock?.ws && sock.ws.readyState === 1) {
             await sock.end();
-          } else {
-            console.warn('⚠ Socket not open, skipping end().');
           }
-        } catch (err) {
-          if (!/WebSocket was closed before the connection/.test(String(err))) {
-            console.error('Error ending socket:', err);
-          }
-        }
+        } catch {}
         startBot();
         return;
       }
 
       try {
-        // ping to keep connection alive
         if (sock?.ws && sock.ws.readyState === 1) {
           sock.ws.ping();
         }
-      } catch (err) {
-        console.error('⚠ Heartbeat failed:', err);
-      }
+      } catch {}
     }, 20000);
 
     console.log('Bot started.');
@@ -225,10 +195,8 @@ process.on('SIGINT', async () => {
   console.log('\n👋 Shutting down...');
   shouldStop = true;
   try {
-    if (sock) {
-      if (sock.ws && sock.ws.readyState === 1) {
-        await sock.end();
-      }
+    if (sock && sock.ws && sock.ws.readyState === 1) {
+      await sock.end();
     }
   } catch {}
   server.close(() => process.exit(0));
