@@ -77,7 +77,7 @@ async function startBot() {
 
       if (qr) {
         broadcast({ type: 'qr', qr });
-        console.log('📷 New QR generated.');
+        console.log('📷 New QR generated.'); //
       }
 
       if (connection === 'open') {
