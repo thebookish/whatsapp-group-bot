@@ -13,6 +13,7 @@ const app = express();
 const PORT = 3000;
 const AUTH_DIR = 'auth_info_baileys';
 const KEEP_ALIVE_MS = 10000;
+const TRIGGER_KEYWORD = 'tony'; // change trigger word here
 
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('/health', (req, res) => res.json({ ok: true }));
@@ -33,7 +34,6 @@ let sock = null;
 let saveCreds = null;
 let isStarting = false;
 let shouldStop = false;
-let botJid = null; // Store bot's JID
 
 function extractTextFromMessage(message) {
   if (!message) return '';
@@ -45,38 +45,6 @@ function extractTextFromMessage(message) {
   if (typeof message.listResponseMessage?.singleSelectReply?.selectedRowId === 'string') return message.listResponseMessage.singleSelectReply.selectedRowId;
   if (message?.text?.body) return message.text.body;
   return '';
-}
-
-function isBotMentioned(message, botJid) {
-  if (!message || !botJid) return false;
-  
-  // Check for mentions in extendedTextMessage
-  if (message.extendedTextMessage?.contextInfo?.mentionedJid?.includes(botJid)) {
-    return true;
-  }
-  
-  // Check for mentions in regular message
-  if (message.contextInfo?.mentionedJid?.includes(botJid)) {
-    return true;
-  }
-  
-  return false;
-}
-
-function isBotRepliedTo(message, botJid) {
-  if (!message || !botJid) return false;
-  
-  // Check if this is a reply to bot's message
-  const quotedMsg = message.extendedTextMessage?.contextInfo?.quotedMessage;
-  const stanzaId = message.extendedTextMessage?.contextInfo?.stanzaId;
-  const participant = message.extendedTextMessage?.contextInfo?.participant;
-  
-  // If replying to a message from the bot
-  if (participant === botJid || (quotedMsg && stanzaId)) {
-    return true;
-  }
-  
-  return false;
 }
 
 async function startBot() {
@@ -113,8 +81,6 @@ async function startBot() {
 
       if (connection === 'open') {
         console.log('✅ WhatsApp connected');
-        botJid = sock.user.id; // Store bot's JID when connected
-        console.log('🤖 Bot JID:', botJid);
         broadcast({ type: 'status', status: 'connected' });
       } else if (connection === 'close') {
         const reason = lastDisconnect?.error?.output?.statusCode;
@@ -155,52 +121,29 @@ async function startBot() {
         if (!text?.trim()) return;
         text = text.trim();
 
-        let shouldRespond = false;
         let sendPrivately = false;
 
         if (isGroup) {
-          // In groups, only respond if bot is mentioned or replied to
-          const isMentioned = isBotMentioned(msg.message, botJid);
-          const isRepliedTo = isBotRepliedTo(msg.message, botJid);
-          
-          if (isMentioned || isRepliedTo) {
-            shouldRespond = true;
-            console.log(`🎯 Bot ${isMentioned ? 'mentioned' : 'replied to'} in group ${groupId}`);
-            
-            // Clean up mention from text if present
-            if (isMentioned) {
-              // Remove @mention from text (WhatsApp mentions appear as @[number])
-              text = text.replace(/@\d+/g, '').trim();
-            }
-            
-            // Check for private reply request
-            if (/reply\s+me\s+privately|dm\s+me|private\s+reply/i.test(text)) {
-              sendPrivately = true;
-              text = text.replace(/reply\s+me\s+privately|dm\s+me|private\s+reply/gi, '').trim();
-            }
+          if (!text.toLowerCase().startsWith(TRIGGER_KEYWORD.toLowerCase())) return;
+          text = text.slice(TRIGGER_KEYWORD.length).trim();
+
+          if (/reply\s+me\s+privately|dm\s+me|private\s+reply/i.test(text)) {
+            sendPrivately = true;
+            text = text.replace(/reply\s+me\s+privately|dm\s+me|private\s+reply/gi, '').trim();
           }
-        } else {
-          // In private chats, always respond
-          shouldRespond = true;
-          console.log(`💬 Private message from ${senderId}`);
+          if (!text) return;
         }
 
-        if (!shouldRespond || !text) return;
-
-        console.log(`🤖 Processing message: "${text}"`);
         const aiReply = await getAIResponse(conversationKey, text);
 
         if (isGroup) {
           if (sendPrivately) {
             await sock.sendMessage(senderId, { text: aiReply });
-            console.log(`📤 Sent private reply to ${senderId}`);
           } else {
             await sock.sendMessage(groupId, { text: aiReply });
-            console.log(`📤 Sent group reply to ${groupId}`);
           }
         } else {
           await sock.sendMessage(senderId, { text: aiReply });
-          console.log(`📤 Sent private reply to ${senderId}`);
         }
       } catch (err) {
         console.error('messages.upsert error:', err);
