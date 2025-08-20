@@ -1,4 +1,10 @@
 const axios = require('axios');
+const { createClient } = require('@supabase/supabase-js');
+
+// === Supabase Configuration ===
+const supabaseUrl = 'https://jlznlwkluocqjnepxwbv.supabase.co';
+const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Impsem5sd2tsdW9jcWpuZXB4d2J2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTU3MDA3MDAsImV4cCI6MjA3MTI3NjcwMH0.8gFwwwcV9w2Pcs-QObN2uyuxnf9lGjzhRotR56BMTwo';
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 // === API Key ===
 const OPENROUTER_API_KEY = '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';
@@ -14,8 +20,8 @@ const ONBOARDING_STEPS = {
 
 const GREETING_PATTERNS = /(^|\W)(hello|hi|hey|start|begin)(\W|$)/i;
 
-// Store all student profiles and history in memory
-const userPrefs = new Map();
+// Store active sessions in memory
+const activeSessions = new Map();
 
 function createUserProfile() {
   return {
@@ -27,6 +33,112 @@ function createUserProfile() {
     lastInteraction: new Date(),
     conversationHistory: [] // stores { message, response, timestamp }
   };
+}
+
+// Check if user exists in Supabase
+async function checkUserExists(userId) {
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('user_id', userId)
+      .single();
+
+    if (error && error.code !== 'PGRST116') { // PGRST116 = no rows found
+      throw error;
+    }
+
+    return { exists: !!data, user: data };
+  } catch (error) {
+    console.error('Error checking user existence:', error);
+    return { exists: false, user: null };
+  }
+}
+
+// Create new user in Supabase
+async function createUserInDB(userId, profile) {
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .insert([
+        {
+          user_id: userId,
+          name: profile.name,
+          interests: profile.interests,
+          goals: profile.goals,
+          country: profile.country,
+          created_at: new Date(),
+          last_interaction: new Date()
+        }
+      ])
+      .select()
+      .single();
+
+    if (error) throw error;
+    return data;
+  } catch (error) {
+    console.error('Error creating user in DB:', error);
+    throw error;
+  }
+}
+
+// Update user in Supabase
+async function updateUserInDB(userId, updates) {
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .update({
+        ...updates,
+        last_interaction: new Date()
+      })
+      .eq('user_id', userId)
+      .select()
+      .single();
+
+    if (error) throw error;
+    return data;
+  } catch (error) {
+    console.error('Error updating user in DB:', error);
+    throw error;
+  }
+}
+
+// Get conversation history from Supabase
+async function getConversationHistory(userId) {
+  try {
+    const { data, error } = await supabase
+      .from('conversations')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: true })
+      .limit(20);
+
+    if (error) throw error;
+    return data || [];
+  } catch (error) {
+    console.error('Error getting conversation history:', error);
+    return [];
+  }
+}
+
+// Save conversation to Supabase
+async function saveConversation(userId, message, response) {
+  try {
+    const { error } = await supabase
+      .from('conversations')
+      .insert([
+        {
+          user_id: userId,
+          message: message,
+          response: response,
+          created_at: new Date()
+        }
+      ]);
+
+    if (error) throw error;
+  } catch (error) {
+    console.error('Error saving conversation:', error);
+  }
 }
 
 // Extract text from WhatsApp message formats
@@ -72,8 +184,8 @@ function validateMessage(msg) {
 }
 
 // Generate AI reply based on student profile + conversation history
-async function generateAIResponse(profile, studentMessage) {
-  const historyContext = profile.conversationHistory
+async function generateAIResponse(profile, studentMessage, conversationHistory = []) {
+  const historyContext = conversationHistory
     .map(h => `User: ${h.message}\nAssistant: ${h.response}`)
     .join('\n');
 
@@ -92,7 +204,7 @@ Student Info:
 - Goals: ${profile.goals}
 - Country: ${profile.country}
 
-Chat History:
+Recent Chat History:
 ${historyContext}
 
 Student's Latest Question:
@@ -141,52 +253,90 @@ async function getAIResponse(userId, rawMessage) {
     messageText = validateMessage(messageText);
     const lowerMsg = messageText.toLowerCase();
 
-    // Create profile if new user
-    if (!userPrefs.has(uid)) {
-      userPrefs.set(uid, createUserProfile());
-    }
-    const profile = userPrefs.get(uid);
-    profile.lastInteraction = new Date();
+    // Check if user exists in database
+    const { exists, user } = await checkUserExists(uid);
+    
+    let profile;
+    let isOnboarding = false;
 
-    // Greeting resets onboarding
-    if (GREETING_PATTERNS.test(lowerMsg)) {
-      profile.onboardingStep = ONBOARDING_STEPS.NAME;
-      profile.conversationHistory = [];
-      return `👋 Hello! I'm your Student Assistant.\nLet's get started!\n\nWhat's your name?`;
+    if (!exists) {
+      // New user - start onboarding regardless of message
+      profile = createUserProfile();
+      activeSessions.set(uid, profile);
+      isOnboarding = true;
+    } else {
+      // Existing user - load from database or create session
+      if (activeSessions.has(uid)) {
+        profile = activeSessions.get(uid);
+      } else {
+        // Create session from DB data
+        profile = {
+          name: user.name,
+          interests: user.interests,
+          goals: user.goals,
+          country: user.country,
+          onboardingStep: ONBOARDING_STEPS.COMPLETE,
+          lastInteraction: new Date(),
+          conversationHistory: await getConversationHistory(uid)
+        };
+        activeSessions.set(uid, profile);
+      }
+      
+      // Update last interaction in DB
+      await updateUserInDB(uid, {});
     }
 
-    // Onboarding process
-    if (profile.onboardingStep !== ONBOARDING_STEPS.COMPLETE) {
+    // Handle new user onboarding
+    if (isOnboarding || profile.onboardingStep !== ONBOARDING_STEPS.COMPLETE) {
       switch (profile.onboardingStep) {
         case ONBOARDING_STEPS.NAME:
+          if (isOnboarding && GREETING_PATTERNS.test(lowerMsg)) {
+            return `👋 Hello! I'm your Student Assistant.\nLet's get started!\n\nWhat's your name?`;
+          }
           profile.name = messageText;
           profile.onboardingStep = ONBOARDING_STEPS.INTERESTS;
           return `Nice to meet you, ${profile.name}! 🎓\nWhat subjects or fields are you interested in?`;
+          
         case ONBOARDING_STEPS.INTERESTS:
           profile.interests = messageText;
           profile.onboardingStep = ONBOARDING_STEPS.GOALS;
           return `Got it! What are your main study or career goals? (e.g., scholarship, admission, job)`;
+          
         case ONBOARDING_STEPS.GOALS:
           profile.goals = messageText;
           profile.onboardingStep = ONBOARDING_STEPS.COUNTRY;
           return `Great! Which country are you currently in or planning to study in?`;
+          
         case ONBOARDING_STEPS.COUNTRY:
           profile.country = messageText;
           profile.onboardingStep = ONBOARDING_STEPS.COMPLETE;
+          
+          // Save new user to database
+          await createUserInDB(uid, profile);
+          
           return `✅ Profile saved!\nName: ${profile.name}\nInterests: ${profile.interests}\nGoals: ${profile.goals}\nCountry: ${profile.country}\n\nYou can now ask me anything related to your studies!`;
       }
     }
 
-    // If onboarding is complete → answer question
-    const aiReply = await generateAIResponse(profile, messageText);
+    // Handle existing user - they can use greeting words without restarting onboarding
+    if (GREETING_PATTERNS.test(lowerMsg)) {
+      return `👋 Hello ${profile.name}! Welcome back! I'm here to help with your studies.\n\nWhat can I assist you with today?`;
+    }
 
-    // Save chat history
+    // If onboarding is complete → answer question
+    const aiReply = await generateAIResponse(profile, messageText, profile.conversationHistory.slice(-10));
+
+    // Save conversation to database and memory
+    await saveConversation(uid, messageText, aiReply);
+    
     profile.conversationHistory.push({
       message: messageText,
       response: aiReply,
       timestamp: new Date()
     });
-    if (profile.conversationHistory.length > 20) profile.conversationHistory.shift();
+    if (profile.conversationHistory.length > 20) {
+      profile.conversationHistory.shift();
+    }
 
     return aiReply;
 
@@ -203,19 +353,40 @@ async function getAIResponse(userId, rawMessage) {
 function clearUserData(userId) {
   try {
     const uid = validateUserId(userId);
-    return userPrefs.delete(uid);
+    return activeSessions.delete(uid);
   } catch {
     return false;
   }
 }
 
-function getUserStats() {
-  return {
-    totalUsers: userPrefs.size,
-    activeUsers: Array.from(userPrefs.values()).filter(
-      p => Date.now() - p.lastInteraction.getTime() < 24 * 60 * 60 * 1000
-    ).length
-  };
+async function getUserStats() {
+  try {
+    const { count: totalUsers, error: countError } = await supabase
+      .from('users')
+      .select('*', { count: 'exact', head: true });
+
+    if (countError) throw countError;
+
+    const { count: activeUsers, error: activeError } = await supabase
+      .from('users')
+      .select('*', { count: 'exact', head: true })
+      .gte('last_interaction', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
+
+    if (activeError) throw activeError;
+
+    return {
+      totalUsers: totalUsers || 0,
+      activeUsers: activeUsers || 0,
+      activeSessions: activeSessions.size
+    };
+  } catch (error) {
+    console.error('Error getting user stats:', error);
+    return {
+      totalUsers: 0,
+      activeUsers: 0,
+      activeSessions: activeSessions.size
+    };
+  }
 }
 
 module.exports = {
