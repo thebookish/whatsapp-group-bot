@@ -1,335 +1,426 @@
-// server.js
-const express = require('express');
-const path = require('path');
-const {
-  default: makeWASocket,
-  DisconnectReason,
-  useMultiFileAuthState
-} = require('@whiskeysockets/baileys');
-const { getAIResponse } = require('./openrouter');
-const { WebSocketServer } = require('ws');
+// aiAssistant.js
+const axios = require('axios');
+const { createClient } = require('@supabase/supabase-js');
 
-const app = express();
-const PORT = 3000;
-const AUTH_DIR = 'auth_info_baileys';
-const KEEP_ALIVE_MS = 10000;
-const TRIGGER_KEYWORD = 'heybot'; // Trigger word to start conversation
-const CONVERSATION_TIMEOUT = 30 * 60 * 1000; // 30 minutes timeout
+// === Supabase Configuration (use env if available) ===
+const supabaseUrl = process.env.SUPABASE_URL || 'https://jlznlwkluocqjnepxwbv.supabase.co';
+const supabaseKey = process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Impsem5sd2tsdW9jcWpuZXB4d2J2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTU3MDA3MDAsImV4cCI6MjA3MTI3NjcwMH0.8gFwwwcV9w2Pcs-QObN2uyuxnf9lGjzhRotR56BMTwo';
+const supabase = createClient(supabaseUrl, supabaseKey);
 
-app.use(express.static(path.join(__dirname, 'public')));
-app.get('/health', (req, res) => res.json({ ok: true }));
+// === OpenRouter API Key (use env if available) ===
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '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';
 
-const server = app.listen(PORT, () => {
-  console.log(`🚀 Server running at http://localhost:${PORT}`);
-});
+// Onboarding steps
+const ONBOARDING_STEPS = {
+  NAME: 1,
+  INTERESTS: 2,
+  GOALS: 3,
+  COUNTRY: 4,
+  COMPLETE: 0
+};
 
-const wss = new WebSocketServer({ server });
-function broadcast(data) {
-  const str = JSON.stringify(data);
-  wss.clients.forEach(client => {
-    if (client.readyState === 1) client.send(str);
-  });
+// Greetings
+const GREETING_PATTERNS = /\b(hello|hi|hey|start|begin)\b/i;
+
+// Store active sessions in memory
+const activeSessions = new Map();
+
+// ---------- Helpers ----------
+function createUserProfile() {
+  return {
+    name: '',
+    interests: '',
+    goals: '',
+    country: '',
+    onboardingStep: ONBOARDING_STEPS.NAME,
+    lastInteraction: new Date(),
+    conversationHistory: [] // stores { message, response, timestamp }
+  };
 }
 
-let sock = null;
-let saveCreds = null;
-let isStarting = false;
-let shouldStop = false;
-let botJid = null; // Store bot's JID
-let activeConversations = new Map(); // Track active conversations
-
+// Extract text from WhatsApp / Baileys message formats
 function extractTextFromMessage(message) {
-  if (!message) return '';
-  if (typeof message.conversation === 'string') return message.conversation;
-  if (typeof message.extendedTextMessage?.text === 'string') return message.extendedTextMessage.text;
-  if (typeof message.imageMessage?.caption === 'string') return message.imageMessage.caption;
-  if (typeof message.videoMessage?.caption === 'string') return message.videoMessage.caption;
-  if (typeof message.buttonsResponseMessage?.selectedButtonId === 'string') return message.buttonsResponseMessage.selectedButtonId;
-  if (typeof message.listResponseMessage?.singleSelectReply?.selectedRowId === 'string') return message.listResponseMessage.singleSelectReply.selectedRowId;
-  if (message?.text?.body) return message.text.body;
+  if (!message) return null;
+  if (typeof message === 'string') return message.trim();
+
+  if (typeof message.conversation === 'string') return message.conversation.trim();
+  if (message.extendedTextMessage?.text) return message.extendedTextMessage.text.trim();
+  if (message.imageMessage?.caption) return message.imageMessage.caption.trim();
+  if (message.videoMessage?.caption) return message.videoMessage.caption.trim();
+  if (message.text) {
+    if (typeof message.text === 'string') return message.text.trim();
+    if (message.text.body) return message.text.body.trim();
+  }
+  return null;
+}
+
+function validateUserId(userId) {
+  if (!userId || typeof userId !== 'string') {
+    throw new Error('Invalid userId');
+  }
+  return userId;
+}
+
+function validateMessage(msg) {
+  if (!msg || typeof msg !== 'string' || !msg.trim()) {
+    throw new Error('Empty message');
+  }
+  if (msg.length > 1000) {
+    throw new Error('Message too long');
+  }
+  return msg.trim();
+}
+
+// Greeting-only check (e.g., "hi", "hello", "hey hey")
+function isGreetingOnly(text) {
+  const cleaned = text.toLowerCase().replace(/[^a-z\s']/g, ' ').trim();
+  if (!cleaned) return false;
+  const words = cleaned.split(/\s+/).filter(Boolean);
+  return words.length > 0 && words.every(w => /(hello|hi|hey|start|begin)/.test(w));
+}
+
+// Extract a probable name from common patterns
+function extractNameFromText(text) {
+  // Try structured patterns
+  const p1 = /(my name is|i am|i'm|this is)\s+([^\n,.;!?]+)/i.exec(text);
+  if (p1 && p1[2]) return p1[2].trim();
+
+  // If starts with a greeting, strip it and punctuation
+  const p2 = /^(hello|hi|hey)[\s,!:;-]*(.*)$/i.exec(text.trim());
+  if (p2 && p2[2]) {
+    const rest = p2[2].trim();
+    // If the rest looks like a name (at least one word)
+    if (rest) return rest;
+  }
+
+  // Fallback: if it's shortish (<= 60 chars) and not greeting-only, take it as name
+  if (!isGreetingOnly(text) && text.trim().length <= 60) return text.trim();
   return '';
 }
 
-function isBotMentioned(message, botJid) {
-  if (!message || !botJid) return false;
-  
-  // Check for mentions in extendedTextMessage
-  if (message.extendedTextMessage?.contextInfo?.mentionedJid?.includes(botJid)) {
-    return true;
-  }
-  
-  // Check for mentions in regular message
-  if (message.contextInfo?.mentionedJid?.includes(botJid)) {
-    return true;
-  }
-  
-  return false;
-}
-
-function isBotRepliedTo(message, botJid) {
-  if (!message || !botJid) return false;
-  
-  // Check if this is a reply to bot's message
-  const quotedMsg = message.extendedTextMessage?.contextInfo?.quotedMessage;
-  const stanzaId = message.extendedTextMessage?.contextInfo?.stanzaId;
-  const participant = message.extendedTextMessage?.contextInfo?.participant;
-  
-  // If replying to a message from the bot
-  if (participant === botJid || (quotedMsg && stanzaId)) {
-    return true;
-  }
-  
-  return false;
-}
-
-function isConversationActive(conversationKey) {
-  const conversation = activeConversations.get(conversationKey);
-  if (!conversation) return false;
-  
-  const now = Date.now();
-  const isActive = now - conversation.lastActivity < CONVERSATION_TIMEOUT;
-  
-  if (!isActive) {
-    activeConversations.delete(conversationKey);
-    console.log(`⏰ Conversation timeout: ${conversationKey}`);
-  }
-  
-  return isActive;
-}
-
-function startConversation(conversationKey) {
-  activeConversations.set(conversationKey, {
-    startTime: Date.now(),
-    lastActivity: Date.now()
-  });
-  console.log(`🆕 Started conversation: ${conversationKey}`);
-}
-
-function updateConversationActivity(conversationKey) {
-  const conversation = activeConversations.get(conversationKey);
-  if (conversation) {
-    conversation.lastActivity = Date.now();
-  }
-}
-
-async function startBot() {
-  if (isStarting) return;
-  isStarting = true;
-
+// ---------- DB ----------
+async function checkUserExists(userId) {
   try {
-    const stateRes = await useMultiFileAuthState(AUTH_DIR);
-    const { state, saveCreds: _saveCreds } = stateRes;
-    saveCreds = _saveCreds;
+    const { data, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('user_id', userId)
+      .single();
 
-    if (sock) {
-      try {
-        if (sock.ws && sock.ws.readyState === 1) {
-          await sock.end();
-        }
-      } catch {}
-      sock = null;
+    if (error && error.code !== 'PGRST116') { // PGRST116 = no rows found
+      throw error;
     }
 
-    sock = makeWASocket({
-      auth: state,
-      printQRInTerminal: false,
-      keepAliveIntervalMs: KEEP_ALIVE_MS,
-    });
-
-    sock.ev.on('connection.update', (update) => {
-      const { connection, lastDisconnect, qr } = update;
-
-      if (qr) {
-        broadcast({ type: 'qr', qr });
-        console.log('📷 New QR generated.');
-      }
-
-      if (connection === 'open') {
-        console.log('✅ WhatsApp connected');
-        botJid = sock.user.id; // Store bot's JID when connected
-        console.log('🤖 Bot JID:', botJid);
-        broadcast({ type: 'status', status: 'connected' });
-      } else if (connection === 'close') {
-        const reason = lastDisconnect?.error?.output?.statusCode;
-        const isLoggedOut = reason === DisconnectReason.loggedOut;
-
-        console.log('🔌 Connection closed.', reason, 'loggedOut:', isLoggedOut);
-        broadcast({ type: 'status', status: 'disconnected', reason });
-
-        if (!isLoggedOut) {
-          setTimeout(() => {
-            isStarting = false;
-            if (!shouldStop) startBot();
-          }, 2000);
-        } else {
-          console.log('❌ Logged out — restart with new QR.');
-        }
-      } else if (connection === 'connecting') {
-        console.log('🔄 WhatsApp connecting...');
-        broadcast({ type: 'status', status: 'connecting' });
-      }
-    });
-
-    sock.ev.on('creds.update', saveCreds);
-
-    // Handle messages
-    sock.ev.on('messages.upsert', async ({ messages }) => {
-      try {
-        if (!messages?.[0] || messages[0].key.fromMe) return;
-        const msg = messages[0];
-        const remoteJid = msg.key.remoteJid || '';
-        const isGroup = remoteJid.endsWith('@g.us');
-        const groupId = isGroup ? remoteJid : null;
-        const participantId = msg.key.participant || remoteJid;
-        const senderId = isGroup ? participantId : remoteJid;
-        
-        // Use consistent user ID for AI (always the actual user's JID)
-        const userId = isGroup ? participantId : senderId;
-        // Use different key for conversation state management (to separate group/private conversations)
-        const conversationKey = isGroup ? `${groupId}_${participantId}` : senderId;
-
-        let text = extractTextFromMessage(msg.message);
-        if (!text?.trim()) return;
-        text = text.trim();
-
-        let shouldRespond = false;
-        let sendPrivately = false;
-        let isNewConversation = false;
-
-        if (isGroup) {
-          const conversationActive = isConversationActive(conversationKey);
-          
-          // Check if message starts with trigger word
-          const startsWithTrigger = text.toLowerCase().startsWith(TRIGGER_KEYWORD.toLowerCase());
-          
-          if (startsWithTrigger) {
-            // Start new conversation or continue existing one
-            if (!conversationActive) {
-              startConversation(conversationKey);
-              isNewConversation = true;
-            }
-            shouldRespond = true;
-            
-            // Remove trigger word from text
-            text = text.slice(TRIGGER_KEYWORD.length).trim();
-            console.log(`🎯 Trigger word used in group ${groupId} by ${participantId}`);
-            
-          } else if (conversationActive) {
-            // Check if bot is mentioned or replied to in active conversation
-            const isMentioned = isBotMentioned(msg.message, botJid);
-            const isRepliedTo = isBotRepliedTo(msg.message, botJid);
-            
-            if (isMentioned || isRepliedTo) {
-              shouldRespond = true;
-              updateConversationActivity(conversationKey);
-              console.log(`🎯 Bot ${isMentioned ? 'mentioned' : 'replied to'} in active conversation ${conversationKey}`);
-              
-              // Clean up mention from text if present
-              if (isMentioned) {
-                text = text.replace(/@\d+/g, '').trim();
-              }
-            }
-          }
-          
-          // Check for private reply request
-          if (shouldRespond && /reply\s+me\s+privately|dm\s+me|private\s+reply/i.test(text)) {
-            sendPrivately = true;
-            text = text.replace(/reply\s+me\s+privately|dm\s+me|private\s+reply/gi, '').trim();
-          }
-          
-        } else {
-          // In private chats, always respond and maintain conversation
-          if (!isConversationActive(conversationKey)) {
-            startConversation(conversationKey);
-            isNewConversation = true;
-          } else {
-            updateConversationActivity(conversationKey);
-          }
-          shouldRespond = true;
-          console.log(`💬 Private message from ${senderId}`);
-        }
-
-        if (!shouldRespond || !text) return;
-
-        console.log(`🤖 Processing message: "${text}" ${isNewConversation ? '(New conversation)' : '(Continuing conversation)'}`);
-        const aiReply = await getAIResponse(userId, text);
-
-        if (isGroup) {
-          if (sendPrivately) {
-            await sock.sendMessage(senderId, { text: aiReply });
-            console.log(`📤 Sent private reply to ${senderId}`);
-          } else {
-            await sock.sendMessage(groupId, { text: aiReply });
-            console.log(`📤 Sent group reply to ${groupId}`);
-          }
-        } else {
-          await sock.sendMessage(senderId, { text: aiReply });
-          console.log(`📤 Sent private reply to ${senderId}`);
-        }
-      } catch (err) {
-        console.error('messages.upsert error:', err);
-      }
-    });
-
-    // Keep-alive ping
-    setInterval(() => {
-      try {
-        if (sock?.ws && sock.ws.readyState === 1) {
-          sock.ws.ping();
-        }
-      } catch {}
-    }, 30000);
-
-    // Presence update every minute to look active
-    setInterval(async () => {
-      try {
-        if (sock?.user) {
-          await sock.sendPresenceUpdate('available');
-          console.log('🟢 Presence updated: available');
-        }
-      } catch (err) {
-        console.error('Presence update error:', err);
-      }
-    }, 60000);
-
-    // Cleanup expired conversations every 5 minutes
-    setInterval(() => {
-      const now = Date.now();
-      let cleanedCount = 0;
-      
-      for (const [key, conversation] of activeConversations.entries()) {
-        if (now - conversation.lastActivity >= CONVERSATION_TIMEOUT) {
-          activeConversations.delete(key);
-          cleanedCount++;
-        }
-      }
-      
-      if (cleanedCount > 0) {
-        console.log(`🧹 Cleaned up ${cleanedCount} expired conversations. Active: ${activeConversations.size}`);
-      }
-    }, 5 * 60 * 1000);
-
-    console.log('Bot started.');
-  } catch (err) {
-    console.error('startBot error:', err);
-    setTimeout(() => {
-      isStarting = false;
-      if (!shouldStop) startBot();
-    }, 2000);
-  } finally {
-    isStarting = false;
+    return { exists: !!data, user: data || null };
+  } catch (error) {
+    console.error('Error checking user existence:', error);
+    return { exists: false, user: null };
   }
 }
 
-startBot();
-
-process.on('SIGINT', async () => {
-  console.log('\n👋 Shutting down...');
-  shouldStop = true;
+async function createUserInDB(userId, profile) {
   try {
-    if (sock && sock.ws && sock.ws.readyState === 1) {
-      await sock.end();
+    const { data, error } = await supabase
+      .from('users')
+      .insert([
+        {
+          user_id: userId,
+          name: profile.name,
+          interests: profile.interests,
+          goals: profile.goals,
+          country: profile.country,
+          created_at: new Date(),
+          last_interaction: new Date()
+        }
+      ])
+      .select()
+      .single();
+
+    if (error) throw error;
+    return data;
+  } catch (error) {
+    console.error('Error creating user in DB:', error);
+    throw error;
+  }
+}
+
+async function updateUserInDB(userId, updates) {
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .update({
+        ...updates,
+        last_interaction: new Date()
+      })
+      .eq('user_id', userId)
+      .select()
+      .single();
+
+    if (error) throw error;
+    return data;
+  } catch (error) {
+    console.error('Error updating user in DB:', error);
+    throw error;
+  }
+}
+
+async function getConversationHistory(userId) {
+  try {
+    const { data, error } = await supabase
+      .from('conversations')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: true })
+      .limit(20);
+
+    if (error) throw error;
+    return data || [];
+  } catch (error) {
+    console.error('Error getting conversation history:', error);
+    return [];
+  }
+}
+
+async function saveConversation(userId, message, response) {
+  try {
+    const { error } = await supabase
+      .from('conversations')
+      .insert([
+        {
+          user_id: userId,
+          message: message,
+          response: response,
+          created_at: new Date()
+        }
+      ]);
+
+    if (error) throw error;
+  } catch (error) {
+    console.error('Error saving conversation:', error);
+  }
+}
+
+// ---------- AI ----------
+async function generateAIResponse(profile, studentMessage, conversationHistory = []) {
+  const historyContext = conversationHistory
+    .map(h => `User: ${h.message}\nAssistant: ${h.response}`)
+    .join('\n');
+
+  const systemPrompt = `
+You are a helpful Student Assistant.
+You can help with university recommendations, scholarships, study tips, admission guidance, and anything a student needs.
+You have access to the student's past interactions and preferences.
+Always answer the student's question politely and clearly.
+After answering, always add a friendly reminder to ask student-related questions so the assistant can be more helpful.
+  `;
+
+  const userPrompt = `
+Student Info:
+- Name: ${profile.name}
+- Interests: ${profile.interests}
+- Goals: ${profile.goals}
+- Country: ${profile.country}
+
+Recent Chat History:
+${historyContext}
+
+Student's Latest Question:
+"${studentMessage}"
+  `;
+
+  const res = await axios.post(
+    'https://openrouter.ai/api/v1/chat/completions',
+    {
+      model: 'mistralai/mistral-7b-instruct',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ],
+      max_tokens: 300,
+      temperature: 0.7
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 15000
     }
-  } catch {}
-  server.close(() => process.exit(0));
-});
+  );
+
+  return res.data.choices?.[0]?.message?.content || "Sorry, I couldn't process your question.";
+}
+
+// ---------- Main ----------
+async function getAIResponse(userId, rawMessage) {
+  try {
+    const uid = validateUserId(userId);
+
+    // Extract and validate message text
+    let messageText = typeof rawMessage === 'object' ? extractTextFromMessage(rawMessage) : rawMessage;
+    if (!messageText) {
+      return "I can only respond to text messages. Please send me a text message!";
+    }
+    messageText = validateMessage(messageText);
+    const lowerMsg = messageText.toLowerCase();
+
+    // Check DB once
+    const { exists, user } = await checkUserExists(uid);
+
+    // ==== SESSION: always prefer in-memory if present ====
+    let profile;
+    if (activeSessions.has(uid)) {
+      profile = activeSessions.get(uid);
+    } else if (exists && user) {
+      // Create session from DB (completed profiles only)
+      profile = {
+        name: user.name || '',
+        interests: user.interests || '',
+        goals: user.goals || '',
+        country: user.country || '',
+        onboardingStep: ONBOARDING_STEPS.COMPLETE,
+        lastInteraction: new Date(),
+        conversationHistory: await getConversationHistory(uid)
+      };
+      activeSessions.set(uid, profile);
+      // Touch last interaction
+      try { await updateUserInDB(uid, {}); } catch (_) {}
+    } else {
+      // Brand-new user session (not in DB yet)
+      profile = createUserProfile();
+      activeSessions.set(uid, profile);
+    }
+
+    // ==== ONBOARDING ====
+    if (profile.onboardingStep !== ONBOARDING_STEPS.COMPLETE) {
+      switch (profile.onboardingStep) {
+        case ONBOARDING_STEPS.NAME: {
+          // If greeting-only, ask for name
+          if (isGreetingOnly(messageText)) {
+            return `👋 Hello! I'm your Student Assistant.\nLet's get started!\n\nWhat's your name?`;
+          }
+          // Try to parse name; if fail, ask again
+          const name = extractNameFromText(messageText);
+          if (!name) {
+            return `No worries—please tell me your name (e.g., "I'm Nabil Hasan").`;
+          }
+          profile.name = name;
+          profile.onboardingStep = ONBOARDING_STEPS.INTERESTS;
+          return `Nice to meet you, ${profile.name}! 🎓\nWhat subjects or fields are you interested in?`;
+        }
+
+        case ONBOARDING_STEPS.INTERESTS: {
+          profile.interests = messageText;
+          profile.onboardingStep = ONBOARDING_STEPS.GOALS;
+          return `Got it! What are your main study or career goals? (e.g., scholarship, admission, job)`;
+        }
+
+        case ONBOARDING_STEPS.GOALS: {
+          profile.goals = messageText;
+          profile.onboardingStep = ONBOARDING_STEPS.COUNTRY;
+          return `Great! Which country are you currently in or planning to study in?`;
+        }
+
+        case ONBOARDING_STEPS.COUNTRY: {
+          profile.country = messageText;
+          profile.onboardingStep = ONBOARDING_STEPS.COMPLETE;
+
+          // Persist brand-new user only once onboarding completes
+          try {
+            await createUserInDB(uid, profile);
+          } catch (e) {
+            // If insert fails due to race/dup, try an update
+            try { await updateUserInDB(uid, {
+              name: profile.name,
+              interests: profile.interests,
+              goals: profile.goals,
+              country: profile.country
+            }); } catch (_) {}
+          }
+
+          return `✅ Profile saved!\nName: ${profile.name}\nInterests: ${profile.interests}\nGoals: ${profile.goals}\nCountry: ${profile.country}\n\nYou can now ask me anything related to your studies!`;
+        }
+      }
+    }
+
+    // ==== Existing user flow ====
+    if (GREETING_PATTERNS.test(lowerMsg)) {
+      return `👋 Hello ${profile.name || 'there'}! Welcome back! I'm here to help with your studies.\n\nWhat can I assist you with today?`;
+    }
+
+    const aiReply = await generateAIResponse(profile, messageText, profile.conversationHistory.slice(-10));
+
+    // Save conversation
+    try {
+      await saveConversation(uid, messageText, aiReply);
+    } catch (_) {}
+
+    // Update in-memory history
+    profile.conversationHistory.push({
+      message: messageText,
+      response: aiReply,
+      timestamp: new Date()
+    });
+    if (profile.conversationHistory.length > 20) {
+      profile.conversationHistory.shift();
+    }
+
+    // Update DB last_interaction if the user exists in DB
+    if (exists) {
+      try { await updateUserInDB(uid, {}); } catch (_) {}
+    }
+
+    return aiReply;
+
+  } catch (error) {
+    console.error('getAIResponse error:', error.message);
+    if (error.message.includes('Invalid userId')) return "❌ Invalid user ID.";
+    if (error.message.includes('Empty message')) return "❌ Please send a message.";
+    if (error.message.includes('Message too long')) return "❌ Message too long. Keep it under 1000 chars.";
+    return "❌ Sorry, something went wrong. Try again or say 'hello'.";
+  }
+}
+
+// ---------- Utilities ----------
+function clearUserData(userId) {
+  try {
+    const uid = validateUserId(userId);
+    return activeSessions.delete(uid);
+  } catch {
+    return false;
+  }
+}
+
+async function getUserStats() {
+  try {
+    const { count: totalUsers, error: countError } = await supabase
+      .from('users')
+      .select('*', { count: 'exact', head: true });
+    if (countError) throw countError;
+
+    const { count: activeUsers, error: activeError } = await supabase
+      .from('users')
+      .select('*', { count: 'exact', head: true })
+      .gte('last_interaction', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
+    if (activeError) throw activeError;
+
+    return {
+      totalUsers: totalUsers || 0,
+      activeUsers: activeUsers || 0,
+      activeSessions: activeSessions.size
+    };
+  } catch (error) {
+    console.error('Error getting user stats:', error);
+    return {
+      totalUsers: 0,
+      activeUsers: 0,
+      activeSessions: activeSessions.size
+    };
+  }
+}
+
+module.exports = {
+  getAIResponse,
+  clearUserData,
+  getUserStats
+};

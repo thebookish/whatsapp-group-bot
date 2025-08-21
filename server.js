@@ -182,6 +182,10 @@ async function startBot() {
         const groupId = isGroup ? remoteJid : null;
         const participantId = msg.key.participant || remoteJid;
         const senderId = isGroup ? participantId : remoteJid;
+        
+        // Use consistent user ID for AI (always the actual user's JID)
+        const userId = isGroup ? participantId : senderId;
+        // Use different key for conversation state management (to separate group/private conversations)
         const conversationKey = isGroup ? `${groupId}_${participantId}` : senderId;
 
         let text = extractTextFromMessage(msg.message);
@@ -248,7 +252,7 @@ async function startBot() {
         if (!shouldRespond || !text) return;
 
         console.log(`🤖 Processing message: "${text}" ${isNewConversation ? '(New conversation)' : '(Continuing conversation)'}`);
-        const aiReply = await getAIResponse(conversationKey, text);
+        const aiReply = await getAIResponse(userId, text);
 
         if (isGroup) {
           if (sendPrivately) {
