@@ -13,7 +13,8 @@ const app = express();
 const PORT = 3000;
 const AUTH_DIR = 'auth_info_baileys';
 const KEEP_ALIVE_MS = 10000;
-const TRIGGER_KEYWORD = 'tony'; // change trigger word here
+const TRIGGER_KEYWORD = 'heybot'; // Trigger word to start conversation
+const CONVERSATION_TIMEOUT = 30 * 60 * 1000; // 30 minutes timeout
 
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('/health', (req, res) => res.json({ ok: true }));
@@ -34,6 +35,8 @@ let sock = null;
 let saveCreds = null;
 let isStarting = false;
 let shouldStop = false;
+let botJid = null; // Store bot's JID
+let activeConversations = new Map(); // Track active conversations
 
 function extractTextFromMessage(message) {
   if (!message) return '';
@@ -45,6 +48,68 @@ function extractTextFromMessage(message) {
   if (typeof message.listResponseMessage?.singleSelectReply?.selectedRowId === 'string') return message.listResponseMessage.singleSelectReply.selectedRowId;
   if (message?.text?.body) return message.text.body;
   return '';
+}
+
+function isBotMentioned(message, botJid) {
+  if (!message || !botJid) return false;
+  
+  // Check for mentions in extendedTextMessage
+  if (message.extendedTextMessage?.contextInfo?.mentionedJid?.includes(botJid)) {
+    return true;
+  }
+  
+  // Check for mentions in regular message
+  if (message.contextInfo?.mentionedJid?.includes(botJid)) {
+    return true;
+  }
+  
+  return false;
+}
+
+function isBotRepliedTo(message, botJid) {
+  if (!message || !botJid) return false;
+  
+  // Check if this is a reply to bot's message
+  const quotedMsg = message.extendedTextMessage?.contextInfo?.quotedMessage;
+  const stanzaId = message.extendedTextMessage?.contextInfo?.stanzaId;
+  const participant = message.extendedTextMessage?.contextInfo?.participant;
+  
+  // If replying to a message from the bot
+  if (participant === botJid || (quotedMsg && stanzaId)) {
+    return true;
+  }
+  
+  return false;
+}
+
+function isConversationActive(conversationKey) {
+  const conversation = activeConversations.get(conversationKey);
+  if (!conversation) return false;
+  
+  const now = Date.now();
+  const isActive = now - conversation.lastActivity < CONVERSATION_TIMEOUT;
+  
+  if (!isActive) {
+    activeConversations.delete(conversationKey);
+    console.log(`⏰ Conversation timeout: ${conversationKey}`);
+  }
+  
+  return isActive;
+}
+
+function startConversation(conversationKey) {
+  activeConversations.set(conversationKey, {
+    startTime: Date.now(),
+    lastActivity: Date.now()
+  });
+  console.log(`🆕 Started conversation: ${conversationKey}`);
+}
+
+function updateConversationActivity(conversationKey) {
+  const conversation = activeConversations.get(conversationKey);
+  if (conversation) {
+    conversation.lastActivity = Date.now();
+  }
 }
 
 async function startBot() {
@@ -81,6 +146,8 @@ async function startBot() {
 
       if (connection === 'open') {
         console.log('✅ WhatsApp connected');
+        botJid = sock.user.id; // Store bot's JID when connected
+        console.log('🤖 Bot JID:', botJid);
         broadcast({ type: 'status', status: 'connected' });
       } else if (connection === 'close') {
         const reason = lastDisconnect?.error?.output?.statusCode;
@@ -121,29 +188,79 @@ async function startBot() {
         if (!text?.trim()) return;
         text = text.trim();
 
+        let shouldRespond = false;
         let sendPrivately = false;
+        let isNewConversation = false;
 
         if (isGroup) {
-          if (!text.toLowerCase().startsWith(TRIGGER_KEYWORD.toLowerCase())) return;
-          text = text.slice(TRIGGER_KEYWORD.length).trim();
-
-          if (/reply\s+me\s+privately|dm\s+me|private\s+reply/i.test(text)) {
+          const conversationActive = isConversationActive(conversationKey);
+          
+          // Check if message starts with trigger word
+          const startsWithTrigger = text.toLowerCase().startsWith(TRIGGER_KEYWORD.toLowerCase());
+          
+          if (startsWithTrigger) {
+            // Start new conversation or continue existing one
+            if (!conversationActive) {
+              startConversation(conversationKey);
+              isNewConversation = true;
+            }
+            shouldRespond = true;
+            
+            // Remove trigger word from text
+            text = text.slice(TRIGGER_KEYWORD.length).trim();
+            console.log(`🎯 Trigger word used in group ${groupId} by ${participantId}`);
+            
+          } else if (conversationActive) {
+            // Check if bot is mentioned or replied to in active conversation
+            const isMentioned = isBotMentioned(msg.message, botJid);
+            const isRepliedTo = isBotRepliedTo(msg.message, botJid);
+            
+            if (isMentioned || isRepliedTo) {
+              shouldRespond = true;
+              updateConversationActivity(conversationKey);
+              console.log(`🎯 Bot ${isMentioned ? 'mentioned' : 'replied to'} in active conversation ${conversationKey}`);
+              
+              // Clean up mention from text if present
+              if (isMentioned) {
+                text = text.replace(/@\d+/g, '').trim();
+              }
+            }
+          }
+          
+          // Check for private reply request
+          if (shouldRespond && /reply\s+me\s+privately|dm\s+me|private\s+reply/i.test(text)) {
             sendPrivately = true;
             text = text.replace(/reply\s+me\s+privately|dm\s+me|private\s+reply/gi, '').trim();
           }
-          if (!text) return;
+          
+        } else {
+          // In private chats, always respond and maintain conversation
+          if (!isConversationActive(conversationKey)) {
+            startConversation(conversationKey);
+            isNewConversation = true;
+          } else {
+            updateConversationActivity(conversationKey);
+          }
+          shouldRespond = true;
+          console.log(`💬 Private message from ${senderId}`);
         }
 
+        if (!shouldRespond || !text) return;
+
+        console.log(`🤖 Processing message: "${text}" ${isNewConversation ? '(New conversation)' : '(Continuing conversation)'}`);
         const aiReply = await getAIResponse(conversationKey, text);
 
         if (isGroup) {
           if (sendPrivately) {
             await sock.sendMessage(senderId, { text: aiReply });
+            console.log(`📤 Sent private reply to ${senderId}`);
           } else {
             await sock.sendMessage(groupId, { text: aiReply });
+            console.log(`📤 Sent group reply to ${groupId}`);
           }
         } else {
           await sock.sendMessage(senderId, { text: aiReply });
+          console.log(`📤 Sent private reply to ${senderId}`);
         }
       } catch (err) {
         console.error('messages.upsert error:', err);
@@ -170,6 +287,23 @@ async function startBot() {
         console.error('Presence update error:', err);
       }
     }, 60000);
+
+    // Cleanup expired conversations every 5 minutes
+    setInterval(() => {
+      const now = Date.now();
+      let cleanedCount = 0;
+      
+      for (const [key, conversation] of activeConversations.entries()) {
+        if (now - conversation.lastActivity >= CONVERSATION_TIMEOUT) {
+          activeConversations.delete(key);
+          cleanedCount++;
+        }
+      }
+      
+      if (cleanedCount > 0) {
+        console.log(`🧹 Cleaned up ${cleanedCount} expired conversations. Active: ${activeConversations.size}`);
+      }
+    }, 5 * 60 * 1000);
 
     console.log('Bot started.');
   } catch (err) {
