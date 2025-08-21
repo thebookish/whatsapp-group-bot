@@ -177,15 +177,15 @@ async function startBot() {
       try {
         if (!messages?.[0] || messages[0].key.fromMe) return;
         const msg = messages[0];
-const remoteJid = msg.key.remoteJid || '';
-const isGroup = remoteJid.endsWith('@g.us');
-
-const participantId = msg.key.participant || remoteJid;  // In groups, the actual sender
-const userId = isGroup ? participantId : remoteJid;      // Always user’s JID (not group JID)
+        const remoteJid = msg.key.remoteJid || '';
+        const isGroup = remoteJid.endsWith('@g.us');
+        const groupId = isGroup ? remoteJid : null;
+        const participantId = msg.key.participant || remoteJid;
+        const senderId = isGroup ? participantId : remoteJid;
+        const userId = isGroup ? participantId : remoteJid;      // Always user’s JID (not group JID)
 
 // Use different key for conversation state management
 const conversationKey = isGroup ? `${remoteJid}_${participantId}` : remoteJid;
-
 
         let text = extractTextFromMessage(msg.message);
         if (!text?.trim()) return;
