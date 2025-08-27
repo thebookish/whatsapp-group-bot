@@ -19,17 +19,25 @@ let PROVIDERS_CACHE = null;
 // === Accommodation (UK) via public API ===
 const NESTORIA_ENDPOINT = 'https://api.nestoria.co.uk/api'; // public, no API key
 
+// ---------------- Utils ----------------
+function ensureHttps(url = '') {
+  if (!url) return '';
+  if (/^https?:\/\//i.test(url)) return url;
+  return `https://${url}`;
+}
+
 // ---------------- Providers Data ----------------
 function loadProvidersData() {
   if (PROVIDERS_CACHE) return PROVIDERS_CACHE;
   try {
     const raw = fs.readFileSync(DATA_FILE, 'utf8');
     const parsed = JSON.parse(raw);
+    // JSON is an object keyed by providerId → normalize to array
     PROVIDERS_CACHE = Object.values(parsed || {}).map(p => ({
       id: p.id,
       name: p.name || p.aliasName || '',
       institutionCode: p.institutionCode || '',
-      websiteUrl: p.websiteUrl || '',
+      websiteUrl: ensureHttps(p.websiteUrl || ''),
       logoUrl: p.logoUrl || '',
       address: p.address || {},
       aliases: p.aliases || [],
@@ -59,68 +67,152 @@ function loadProvidersData() {
   return PROVIDERS_CACHE;
 }
 
-// ---------------- Retrieval over Providers ----------------
-function norm(s) { return (s || '').toString().toLowerCase(); }
+// ---------------- Retrieval over Providers (fuzzy, synonym-aware) ----------------
+function normBase(s) {
+  return (s || '')
+    .toString()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/&/g, ' and ')
+    .replace(/[-/_,.()+]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+function norm(s) { return normBase(s); }
 
-function scoreText(text, queryTerms) {
-  const t = norm(text);
-  let score = 0;
-  for (const q of queryTerms) if (q && t.includes(q)) score += q.length;
-  return score;
+const STOP = new Set([
+  'the','a','an','with','and','of','for','in','to','at','on','about','into','from','by',
+  'course','degree','program','programme','pg','ug','undergraduate','postgraduate'
+]);
+
+function tokenize(s) {
+  return norm(s).split(/\s+/).filter(t => t && !STOP.has(t));
 }
 
-// --- Synonym expansion to improve recall (accountancy→accounting etc.)
+function jaccard(a, b) {
+  const A = new Set(a);
+  const B = new Set(b);
+  const inter = [...A].filter(x => B.has(x)).length;
+  const uni = new Set([...A, ...B]).size || 1;
+  return inter / uni;
+}
+
+// Synonym expansion (key for “Accountancy and Business Management” style queries)
 function expandTerms(terms) {
   const map = {
     accountancy: 'accounting',
-    counsellor: 'counselor',
+    accounts: 'accounting',
+    acct: 'accounting',
+    cs: 'computer science',
+    comp: 'computing',
+    'comp sci': 'computer science',
     counselling: 'counseling',
-    'business management': 'business management'
+    counsellor: 'counselor',
+    mgmt: 'management',
+    biz: 'business',
+    bms: 'business management',
+    'software development': 'software',
+    'software engineering': 'software',
+    'business administration': 'business management'
   };
   const extra = [];
   for (const t of terms) {
     const k = t.toLowerCase();
-    if (map[k] && map[k] !== t) extra.push(map[k]);
+    if (map[k]) for (const w of map[k].split(' ')) extra.push(w);
   }
   return [...new Set([...terms, ...extra])];
 }
 
-function findRelevantData(query, opts = { topProviders: 2, topCourses: 4 }) {
-  const providers = loadProvidersData();
-  const baseTerms = norm(query).split(/[^a-z0-9&+]+/).filter(Boolean);
-  const terms = expandTerms(baseTerms);
+function computeProviderScore(provider, qTokens) {
+  const pTokens = new Set([
+    ...tokenize(provider.name),
+    ...tokenize(provider.institutionCode),
+    ...tokenize(provider.aboutUs),
+    ...tokenize(provider.whatMakesUsDifferent),
+    ...((provider.aliases || []).flatMap(a => tokenize(a))),
+    ...((provider.courseLocations || []).flatMap(l => tokenize(`${l.title} ${l.address}`)))
+  ]);
+  const overlap = [...pTokens].filter(t => qTokens.includes(t)).length;
+  return overlap;
+}
 
-  const providerRank = providers
-    .map(p => {
-      const fields = [
-        p.name, p.institutionCode, p.aboutUs, p.whatMakesUsDifferent,
-        ...(p.aliases || []),
-        ...(p.courseLocations?.map(l => `${l.title} ${l.address}`) || [])
-      ].join(' | ');
-      return { p, score: scoreText(fields, terms) };
-    })
+function ucascodesFromQuery(q) {
+  const codes = [];
+  const re = /\b([a-z0-9]{4})\b/ig;
+  let m;
+  while ((m = re.exec(q)) !== null) codes.push(m[1].toUpperCase());
+  return codes;
+}
+
+function computeCourseScore(provider, course, qTokens, qUCAS) {
+  const titleTokens = tokenize(course.title);
+  const optionStrings = (course.options || []).map(o =>
+    `${o.studyMode} ${o.durationQty} ${o.durationType} ${o.location} ${o.startDate} ${o.outcome}`
+  );
+  const textTokens = new Set([
+    ...titleTokens,
+    ...tokenize(course.destination),
+    ...tokenize(provider.name),
+    ...tokenize(provider.institutionCode),
+    ...optionStrings.flatMap(s => tokenize(s))
+  ]);
+
+  // Base token overlap + title similarity
+  const overlap = [...textTokens].filter(t => qTokens.includes(t));
+  const jTitle = jaccard(titleTokens, qTokens);
+
+  // UCAS exact match bonus
+  const ucasBonus = (course.applicationCode && qUCAS.includes(course.applicationCode.toUpperCase())) ? 15 : 0;
+
+  // Explicit keyword boosts
+  let keywordBoost = 0;
+  const kws = new Set(['java','python','software','computing','computer','science','accounting','accountancy','business','management']);
+  for (const t of overlap) if (kws.has(t)) keywordBoost += 1.5;
+
+  const score =
+    12 * jTitle +
+    3 * overlap.length +
+    2 * computeProviderScore(provider, qTokens) +
+    ucasBonus +
+    keywordBoost;
+
+  // Hard gate to avoid random hits
+  const hardGate = jTitle >= 0.2 || overlap.length >= 2 || ucasBonus > 0;
+  return hardGate ? score : 0;
+}
+
+function findRelevantData(query, opts = { topProviders: 3, topCourses: 6 }) {
+  const providers = loadProvidersData();
+  const baseTokens = tokenize(query);
+  const qTokens = expandTerms(baseTokens);
+  const qText = norm(query);
+  const qUCAS = ucascodesFromQuery(qText);
+
+  // Providers (soft)
+  const provScored = providers
+    .map(p => ({ p, score: computeProviderScore(p, qTokens) }))
     .filter(x => x.score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, opts.topProviders);
 
-  const candidateCourses = [];
+  // Courses (fuzzy across ALL providers)
+  const courses = [];
   for (const pv of providers) {
     for (const c of pv.courses) {
-      const text = [
-        pv.name, c.title, c.destination, c.applicationCode,
-        ...c.options.map(o => `${o.studyMode} ${o.durationQty} ${o.durationType} ${o.location} ${o.startDate} ${o.outcome}`)
-      ].join(' | ');
-      const s = scoreText(text, terms);
-      if (s > 0) candidateCourses.push({ provider: pv, course: c, score: s });
+      const score = computeCourseScore(pv, c, qTokens, qUCAS);
+      if (score > 0) courses.push({ provider: pv, course: c, score });
     }
   }
+  const courseRank = courses.sort((a, b) => b.score - a.score).slice(0, opts.topCourses);
 
-  const courseRank = candidateCourses.sort((a, b) => b.score - a.score).slice(0, opts.topCourses);
-
-  return { providers: providerRank.map(x => x.p), courses: courseRank.map(x => ({ provider: x.provider, course: x.course })) };
+  return {
+    providers: provScored.map(x => x.p),
+    courses: courseRank.map(x => ({ provider: x.provider, course: x.course }))
+  };
 }
 
-// --- Helpers for choosing the best option and formatting
+// ---------------- Option picking & formatting ----------------
 function parseDDMMYYYY(s) {
   const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(s || '');
   if (!m) return null;
@@ -159,28 +251,30 @@ function formatCourseLine(providerName, course, opt) {
 
 function buildDirectAnswer(query, results) {
   const { providers, courses } = results;
+
+  // Prefer direct course hits (e.g., “Accountancy and Business Management”)
+  if (courses.length) {
+    return courses
+      .slice(0, 4)
+      .map(({ provider, course }) => formatCourseLine(provider.name, course))
+      .join('\n');
+  }
+
+  // Else show a matched provider’s top 3 courses
   const q = norm(query);
   const providerMention = providers.find(p => q.includes(norm(p.name)));
   const targetProvider = providerMention || providers[0];
 
   if (targetProvider) {
-    const provCourses = (courses.filter(c => c.provider.id === targetProvider.id).map(c => c.course));
-    const fallbackProvCourses = targetProvider.courses.slice(0, 3);
-    const chosen = (provCourses.length ? provCourses : fallbackProvCourses).slice(0, 3);
-
+    const chosen = targetProvider.courses.slice(0, 3);
     const lines = [];
     lines.push(`For *${targetProvider.name}*:`);
-    for (const c of chosen) {
-      lines.push(formatCourseLine(targetProvider.name, c));
-    }
+    for (const c of chosen) lines.push(formatCourseLine(targetProvider.name, c));
     if (targetProvider.websiteUrl) lines.push(`More info: ${targetProvider.websiteUrl}`);
     return lines.join('\n');
   }
 
-  if (courses.length) {
-    return courses.slice(0, 4).map(({ provider, course }) => formatCourseLine(provider.name, course)).join('\n');
-  }
-
+  // Nothing matched in dataset
   return '';
 }
 
@@ -211,7 +305,7 @@ function buildDataContext(results) {
   return lines.join('\n');
 }
 
-// --- Sanitize any LLM output to remove placeholders or empty labels
+// ---------------- Sanitize any LLM output (no placeholders) ----------------
 function sanitizeLLMReply(text) {
   if (!text) return text;
   let t = text.replace(/\[[^\]]+\]/g, ''); // remove [placeholders]
@@ -321,7 +415,7 @@ async function updateUserInDB(userId, updates) {
     const { data, error } = await supabase.from('users').update({
       ...updates, last_interaction: new Date()
     }).eq('user_id', userId).select().single();
-    if (error) throw error;
+  if (error) throw error;
     return data;
   } catch (error) {
     console.error('Error updating user in DB:', error);
@@ -362,19 +456,19 @@ function parseAccommodationQuery(text) {
   const priceMatch = q.match(/\b(?:under|<=?|max|up to)\s*[£$]?\s*(\d{2,5})\b/) || q.match(/\b[£$]\s*(\d{2,5})\b/);
   const price_max = priceMatch ? parseInt(priceMatch[1], 10) : undefined;
 
-  // Extract bedrooms "1 bed", "2 beds", "studio" (studio -> 0 or 1)
+  // Extract bedrooms "1 bed", "2 beds", "studio" (studio -> 0)
   let bedrooms;
   const bedMatch = q.match(/\b(\d)\s*(?:bed|beds|bedroom|bedrooms)\b/);
   if (bedMatch) bedrooms = parseInt(bedMatch[1], 10);
   else if (/\bstudio\b/.test(q)) bedrooms = 0;
 
-  // Rough location: last meaningful word group after "in", "at", "near"
+  // Rough location after "in|at|near|around"
   let place_name;
   const locMatch = q.match(/\b(?:in|at|near|around)\s+([a-z\s\-&']{2,})$/i);
   if (locMatch) {
     place_name = locMatch[1].trim();
   } else {
-    // fallback: first capitalized token(s) (very heuristic)
+    // fallback: first Capitalized token(s)
     const cap = (text.match(/[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*/g) || [])[0];
     if (cap) place_name = cap.trim();
   }
@@ -423,7 +517,7 @@ async function searchUKAccommodation({ place_name, price_max, bedrooms, page = 1
   }
 }
 
-function formatAccommodationReply(listings, opts = {}) {
+function formatAccommodationReply(listings) {
   if (!listings.length) return 'Couldn’t find live listings for that—try a nearby area or raise budget a bit?';
   const top = listings.slice(0, 5);
   const lines = top.map(l =>
@@ -583,10 +677,12 @@ async function getAIResponse(userId, rawMessage) {
       return reply;
     }
 
-    // ==== Data-first answering from providers file ====
+    // ==== Data-first answering from providers file (now fuzzy & robust) ====
     const retrieval = findRelevantData(messageText);
     const direct = buildDirectAnswer(messageText, retrieval);
     if (direct) {
+      // E.g., for your sample:
+      // • Accountancy and Business Management (MA (Hons)) – Full-time – 4 Years – Main Site – starts 15/09/2025 – UCAS: NN24
       try { await saveConversation(uid, messageText, direct); } catch (_) {}
       profile.conversationHistory.push({ message: messageText, response: direct, timestamp: new Date() });
       if (profile.conversationHistory.length > 20) profile.conversationHistory.shift();
@@ -598,7 +694,7 @@ async function getAIResponse(userId, rawMessage) {
     const dataCtx = buildDataContext(retrieval);
     const aiReply = await generateAIResponse(profile, messageText, profile.conversationHistory.slice(-10), dataCtx);
     const cleaned = sanitizeLLMReply(aiReply);
-    const finalReply = cleaned || "I don’t have those specifics in my course data yet. Want me to check other providers?";
+    const finalReply = cleaned || "I don’t see that course in my dataset. Want me to check similar options or another provider?";
 
     try { await saveConversation(uid, messageText, finalReply); } catch (_) {}
     profile.conversationHistory.push({ message: messageText, response: finalReply, timestamp: new Date() });
