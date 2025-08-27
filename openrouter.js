@@ -1,51 +1,60 @@
-// aiAssistant.js
+
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 
-// === Supabase Configuration (use env if available) ===
+/* ============================
+   Supabase / OpenRouter Config
+============================= */
 const supabaseUrl = process.env.SUPABASE_URL || 'https://jlznlwkluocqjnepxwbv.supabase.co';
 const supabaseKey = process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Impsem5sd2tsdW9jcWpuZXB4d2J2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTU3MDA3MDAsImV4cCI6MjA3MTI3NjcwMH0.8gFwwwcV9w2Pcs-QObN2uyuxnf9lGjzhRotR56BMTwo';
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// === OpenRouter API Key (use env if available) ===
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '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';
 
-// === Local Provider Data (providers_with_courses.json) ===
+/* ============================
+   Dataset (providers_with_courses.json)
+============================= */
 const DATA_FILE = process.env.PROVIDERS_DATA_PATH || path.join(process.cwd(), 'providers_with_courses.json');
 let PROVIDERS_CACHE = null;
 
-// === Accommodation (UK) via public API ===
-const NESTORIA_ENDPOINT = 'https://api.nestoria.co.uk/api'; // public, no API key
+/* ============================
+   UK Accommodation (Nestoria)
+============================= */
+const NESTORIA_ENDPOINT = 'https://api.nestoria.co.uk/api';
 
-// ---------------- Utils ----------------
+/* ============================
+   Small Utils
+============================= */
 function ensureHttps(url = '') {
   if (!url) return '';
   if (/^https?:\/\//i.test(url)) return url;
   return `https://${url}`;
 }
 
-// ---------------- Providers Data ----------------
 function loadProvidersData() {
   if (PROVIDERS_CACHE) return PROVIDERS_CACHE;
   try {
     const raw = fs.readFileSync(DATA_FILE, 'utf8');
-    const parsed = JSON.parse(raw);
-    // JSON is an object keyed by providerId → normalize to array
+    const parsed = JSON.parse(raw || '{}');
+
+    // Input format is an object keyed by providerId
     PROVIDERS_CACHE = Object.values(parsed || {}).map(p => ({
       id: p.id,
       name: p.name || p.aliasName || '',
       institutionCode: p.institutionCode || '',
+      providerSort: p.providerSort || '',
       websiteUrl: ensureHttps(p.websiteUrl || ''),
       logoUrl: p.logoUrl || '',
       address: p.address || {},
-      aliases: p.aliases || [],
+      aliases: Array.isArray(p.aliases) ? p.aliases : [],
       aboutUs: p.aboutUs || '',
       whatMakesUsDifferent: p.whatMakesUsDifferent || '',
       courseLocations: p.courseLocations || [],
       courses: (p.courses || []).map(c => ({
         id: c.id,
+        academicYearId: c.academicYearId || '',
         title: c.courseTitle || '',
         destination: c.routingData?.destination?.caption || '',
         applicationCode: c.applicationCode || null,
@@ -67,7 +76,9 @@ function loadProvidersData() {
   return PROVIDERS_CACHE;
 }
 
-// ---------------- Retrieval over Providers (fuzzy, synonym-aware) ----------------
+/* ============================
+   Retrieval (fuzzy + UCAS aware)
+============================= */
 function normBase(s) {
   return (s || '')
     .toString()
@@ -79,17 +90,14 @@ function normBase(s) {
     .trim()
     .toLowerCase();
 }
-function norm(s) { return normBase(s); }
-
 const STOP = new Set([
   'the','a','an','with','and','of','for','in','to','at','on','about','into','from','by',
   'course','degree','program','programme','pg','ug','undergraduate','postgraduate'
 ]);
-
 function tokenize(s) {
-  return norm(s).split(/\s+/).filter(t => t && !STOP.has(t));
+  if (!s) return [];
+  return normBase(s).split(/\s+/).filter(t => t && !STOP.has(t));
 }
-
 function jaccard(a, b) {
   const A = new Set(a);
   const B = new Set(b);
@@ -97,8 +105,6 @@ function jaccard(a, b) {
   const uni = new Set([...A, ...B]).size || 1;
   return inter / uni;
 }
-
-// Synonym expansion (key for “Accountancy and Business Management” style queries)
 function expandTerms(terms) {
   const map = {
     accountancy: 'accounting',
@@ -114,7 +120,9 @@ function expandTerms(terms) {
     bms: 'business management',
     'software development': 'software',
     'software engineering': 'software',
-    'business administration': 'business management'
+    'business administration': 'business management',
+    ai: 'artificial intelligence',
+    data: 'data science'
   };
   const extra = [];
   for (const t of terms) {
@@ -123,28 +131,28 @@ function expandTerms(terms) {
   }
   return [...new Set([...terms, ...extra])];
 }
-
-function computeProviderScore(provider, qTokens) {
-  const pTokens = new Set([
-    ...tokenize(provider.name),
-    ...tokenize(provider.institutionCode),
-    ...tokenize(provider.aboutUs),
-    ...tokenize(provider.whatMakesUsDifferent),
-    ...((provider.aliases || []).flatMap(a => tokenize(a))),
-    ...((provider.courseLocations || []).flatMap(l => tokenize(`${l.title} ${l.address}`)))
-  ]);
-  const overlap = [...pTokens].filter(t => qTokens.includes(t)).length;
-  return overlap;
-}
-
 function ucascodesFromQuery(q) {
   const codes = [];
   const re = /\b([a-z0-9]{4})\b/ig;
   let m;
-  while ((m = re.exec(q)) !== null) codes.push(m[1].toUpperCase());
+  while ((m = re.exec(q || '')) !== null) codes.push(m[1].toUpperCase());
   return codes;
 }
-
+function computeProviderScore(provider, qTokens) {
+  const pTokens = new Set([
+    ...tokenize(provider.name),
+    ...tokenize(provider.institutionCode),
+    ...tokenize(provider.providerSort),
+    ...tokenize(provider.aboutUs),
+    ...tokenize(provider.whatMakesUsDifferent),
+    ...((provider.aliases || []).flatMap(a => tokenize(a))),
+    ...((provider.courseLocations || []).flatMap(l => tokenize(`${l.title} ${l.address}`))),
+    ...tokenize(provider.address?.line4 || ''),
+    ...tokenize(provider.address?.country?.mappedCaption || '')
+  ]);
+  const overlap = [...pTokens].filter(t => qTokens.includes(t)).length;
+  return overlap;
+}
 function computeCourseScore(provider, course, qTokens, qUCAS) {
   const titleTokens = tokenize(course.title);
   const optionStrings = (course.options || []).map(o =>
@@ -155,19 +163,18 @@ function computeCourseScore(provider, course, qTokens, qUCAS) {
     ...tokenize(course.destination),
     ...tokenize(provider.name),
     ...tokenize(provider.institutionCode),
+    ...tokenize(provider.address?.line4 || ''),
+    ...tokenize(provider.address?.country?.mappedCaption || ''),
     ...optionStrings.flatMap(s => tokenize(s))
   ]);
 
-  // Base token overlap + title similarity
   const overlap = [...textTokens].filter(t => qTokens.includes(t));
   const jTitle = jaccard(titleTokens, qTokens);
 
-  // UCAS exact match bonus
   const ucasBonus = (course.applicationCode && qUCAS.includes(course.applicationCode.toUpperCase())) ? 15 : 0;
 
-  // Explicit keyword boosts
   let keywordBoost = 0;
-  const kws = new Set(['java','python','software','computing','computer','science','accounting','accountancy','business','management']);
+  const kws = new Set(['java','python','software','computing','computer','science','accounting','accountancy','business','management','data','ai','artificial','intelligence']);
   for (const t of overlap) if (kws.has(t)) keywordBoost += 1.5;
 
   const score =
@@ -177,16 +184,14 @@ function computeCourseScore(provider, course, qTokens, qUCAS) {
     ucasBonus +
     keywordBoost;
 
-  // Hard gate to avoid random hits
   const hardGate = jTitle >= 0.2 || overlap.length >= 2 || ucasBonus > 0;
   return hardGate ? score : 0;
 }
-
-function findRelevantData(query, opts = { topProviders: 3, topCourses: 6 }) {
+function findRelevantData(query, opts = { topProviders: 3, topCourses: 8 }) {
   const providers = loadProvidersData();
   const baseTokens = tokenize(query);
   const qTokens = expandTerms(baseTokens);
-  const qText = norm(query);
+  const qText = normBase(query);
   const qUCAS = ucascodesFromQuery(qText);
 
   // Providers (soft)
@@ -212,7 +217,9 @@ function findRelevantData(query, opts = { topProviders: 3, topCourses: 6 }) {
   };
 }
 
-// ---------------- Option picking & formatting ----------------
+/* ============================
+   Option Picking / Formatting
+============================= */
 function parseDDMMYYYY(s) {
   const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(s || '');
   if (!m) return null;
@@ -221,7 +228,6 @@ function parseDDMMYYYY(s) {
   const yyyy = parseInt(m[3], 10);
   return new Date(yyyy, mm - 1, dd);
 }
-
 function pickBestOption(course) {
   const opts = Array.isArray(course.options) ? course.options : [];
   if (!opts.length) return null;
@@ -236,76 +242,52 @@ function pickBestOption(course) {
   return (dated[0] && dated[0].o) || opts[0];
 }
 
-function formatCourseLine(providerName, course, opt) {
-  const o = opt || pickBestOption(course);
-  const bits = [];
-  bits.push(`• ${course.title}`);
-  if (o?.outcome) bits.push(`(${o.outcome})`);
-  if (o?.studyMode) bits.push(`– ${o.studyMode}`);
-  if (o?.durationQty && o?.durationType) bits.push(`– ${o.durationQty} ${o.durationType}`);
-  if (o?.location) bits.push(`– ${o.location}`);
-  if (o?.startDate) bits.push(`– starts ${o.startDate}`);
-  if (course.applicationCode) bits.push(`– UCAS: ${course.applicationCode}`);
-  return bits.join(' ');
-}
-
-function buildDirectAnswer(query, results) {
+/* ============================
+   RAG Context Construction
+============================= */
+function buildRAGContext(results) {
   const { providers, courses } = results;
+  const chunks = [];
 
-  // Prefer direct course hits (e.g., “Accountancy and Business Management”)
-  if (courses.length) {
-    return courses
-      .slice(0, 4)
-      .map(({ provider, course }) => formatCourseLine(provider.name, course))
-      .join('\n');
-  }
-
-  // Else show a matched provider’s top 3 courses
-  const q = norm(query);
-  const providerMention = providers.find(p => q.includes(norm(p.name)));
-  const targetProvider = providerMention || providers[0];
-
-  if (targetProvider) {
-    const chosen = targetProvider.courses.slice(0, 3);
-    const lines = [];
-    lines.push(`For *${targetProvider.name}*:`);
-    for (const c of chosen) lines.push(formatCourseLine(targetProvider.name, c));
-    if (targetProvider.websiteUrl) lines.push(`More info: ${targetProvider.websiteUrl}`);
-    return lines.join('\n');
-  }
-
-  // Nothing matched in dataset
-  return '';
-}
-
-function buildDataContext(results) {
-  const { providers, courses } = results;
-  const lines = [];
-
+  // Provider chunks
   for (const p of providers.slice(0, 3)) {
-    lines.push(`Provider: ${p.name} (Code: ${p.institutionCode})`);
-    const locs = (p.courseLocations || []).map(l => `${l.title} – ${l.address}`).slice(0, 2);
-    if (locs.length) lines.push(`Locations: ${locs.join(' | ')}`);
+    const location = [p.address?.line4, p.address?.country?.mappedCaption].filter(Boolean).join(', ');
+    const lines = [
+      `--- RAG_CHUNK: PROVIDER`,
+      `Provider: ${p.name}`,
+      `Institution Code: ${p.institutionCode || '(not listed)'}`,
+      location ? `Location: ${location}` : null,
+      p.websiteUrl ? `Website: ${p.websiteUrl}` : null,
+      p.aliases?.length ? `Aliases: ${p.aliases.join(', ')}` : null
+    ].filter(Boolean);
+    chunks.push(lines.join('\n'));
   }
 
-  for (const { provider, course } of courses.slice(0, 6)) {
-    const o = pickBestOption(course);
-    const bits = [
-      `Course: ${course.title}`,
-      provider?.name ? `Provider: ${provider.name}` : null,
+  // Course chunks
+  for (const { provider, course } of courses.slice(0, 10)) {
+    const o = pickBestOption(course) || {};
+    const fields = [
+      `--- RAG_CHUNK: COURSE`,
+      `Course Title: ${course.title}`,
+      `Provider: ${provider.name}`,
+      course.destination ? `Level: ${course.destination}` : null,
       course.applicationCode ? `UCAS: ${course.applicationCode}` : null,
-      o?.outcome ? `Outcome: ${o.outcome}` : null,
-      o?.studyMode ? `Mode: ${o?.studyMode}` : null,
-      (o?.durationQty && o?.durationType) ? `Duration: ${o.durationQty} ${o.durationType}` : null,
-      o?.location ? `Campus: ${o.location}` : null,
-      o?.startDate ? `Start: ${o.startDate}` : null
+      o.outcome ? `Outcome: ${o.outcome}` : null,
+      o.studyMode ? `Mode: ${o.studyMode}` : null,
+      (o.durationQty && o.durationType) ? `Duration: ${o.durationQty} ${o.durationType}` : null,
+      o.location ? `Campus: ${o.location}` : null,
+      o.startDate ? `Start: ${o.startDate}` : null
     ].filter(Boolean);
-    lines.push(bits.join(' | '));
+    chunks.push(fields.join('\n'));
   }
-  return lines.join('\n');
+
+  if (!chunks.length) return '(none — no relevant courses/providers found for this query)';
+  return chunks.join('\n\n');
 }
 
-// ---------------- Sanitize any LLM output (no placeholders) ----------------
+/* ============================
+   Output Sanitizer
+============================= */
 function sanitizeLLMReply(text) {
   if (!text) return text;
   let t = text.replace(/\[[^\]]+\]/g, ''); // remove [placeholders]
@@ -321,7 +303,80 @@ function sanitizeLLMReply(text) {
   return filtered.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
-// ---------------- Onboarding & App State ----------------
+/* ============================
+   OpenRouter (RAG-grounded)
+============================= */
+async function generateAIResponse(profile, studentMessage, conversationHistory = [], ragContext = '') {
+  const historyContext = conversationHistory
+    .map(h => `User: ${h.message}\nAssistant: ${h.response}`)
+    .join('\n');
+
+  const systemPrompt = `
+You are a helpful Student Assistant focused on UK university providers and courses.
+
+STYLE:
+- Keep replies short, WhatsApp-like. 1–2 lines if simple; bullets for lists.
+- Prioritize course-level matches first; include provider when useful.
+
+STRICT RULES:
+- Use ONLY the "RAG College Data Context" below for facts (providers, UCAS codes, campuses, start dates, modes, durations).
+- If a field is not present in the context, do NOT invent it. Say: "Not listed in my dataset."
+- No placeholders like [Campus], [Date], etc.
+- If no relevant items exist in RAG context, say briefly that it's not in the dataset and give general guidance (e.g., try related subjects or nearby providers).
+
+RAG College Data Context:
+${ragContext}
+  `.trim();
+
+  const userPrompt = `
+Student Info:
+- Name: ${profile.name}
+- Interests: ${profile.interests}
+- Goals: ${profile.goals}
+- Country: ${profile.country}
+
+Recent Chat History:
+${historyContext}
+
+Student's Latest Question:
+"${studentMessage}"
+
+Respond grounded in the dataset above. Prefer bullets like:
+• <Course Title> (Outcome) – <Mode> – <Duration> – <Campus> – starts <DD/MM/YYYY> – UCAS: <Code>
+Include only the fields present in the RAG context.
+  `.trim();
+
+  try {
+    const res = await axios.post(
+      'https://openrouter.ai/api/v1/chat/completions',
+      {
+        // You can swap to a stronger model if desired
+        model: 'mistralai/mistral-7b-instruct',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt }
+        ],
+        max_tokens: 400,
+        temperature: 0.4
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 15000
+      }
+    );
+    return res.data?.choices?.[0]?.message?.content || "Sorry, I couldn't process that.";
+  } catch (error) {
+    console.error('AI API error:', error?.response?.data || error.message);
+    return "Sorry, I couldn't process that right now.";
+  }
+}
+
+/* ============================
+   Onboarding & App State
+============================= */
 const ONBOARDING_STEPS = { NAME: 1, INTERESTS: 2, GOALS: 3, COUNTRY: 4, COMPLETE: 0 };
 const GREETING_PATTERNS = /\b(hello|hi|hey|start|begin)\b/i;
 const ACCO_PATTERNS = /\b(accommodation|accomodation|accommodation|rent|room|flat|house|hall|student hall|dorm|hostel)\b/i;
@@ -381,7 +436,9 @@ function extractNameFromText(text) {
   return '';
 }
 
-// ---------------- DB helpers ----------------
+/* ============================
+   Supabase DB Helpers
+============================= */
 async function checkUserExists(userId) {
   try {
     const { data, error } = await supabase.from('users').select('*').eq('user_id', userId).single();
@@ -415,7 +472,7 @@ async function updateUserInDB(userId, updates) {
     const { data, error } = await supabase.from('users').update({
       ...updates, last_interaction: new Date()
     }).eq('user_id', userId).select().single();
-  if (error) throw error;
+    if (error) throw error;
     return data;
   } catch (error) {
     console.error('Error updating user in DB:', error);
@@ -448,27 +505,25 @@ async function saveConversation(userId, message, response) {
   }
 }
 
-// ---------------- Accommodation helpers ----------------
+/* ============================
+   Accommodation Helpers (UK)
+============================= */
 function parseAccommodationQuery(text) {
-  const q = norm(text);
+  const q = normBase(text);
 
-  // Extract max price like "under 900", "<=1200", "max 1000", "up to £850"
   const priceMatch = q.match(/\b(?:under|<=?|max|up to)\s*[£$]?\s*(\d{2,5})\b/) || q.match(/\b[£$]\s*(\d{2,5})\b/);
   const price_max = priceMatch ? parseInt(priceMatch[1], 10) : undefined;
 
-  // Extract bedrooms "1 bed", "2 beds", "studio" (studio -> 0)
   let bedrooms;
   const bedMatch = q.match(/\b(\d)\s*(?:bed|beds|bedroom|bedrooms)\b/);
   if (bedMatch) bedrooms = parseInt(bedMatch[1], 10);
   else if (/\bstudio\b/.test(q)) bedrooms = 0;
 
-  // Rough location after "in|at|near|around"
   let place_name;
   const locMatch = q.match(/\b(?:in|at|near|around)\s+([a-z\s\-&']{2,})$/i);
   if (locMatch) {
     place_name = locMatch[1].trim();
   } else {
-    // fallback: first Capitalized token(s)
     const cap = (text.match(/[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*/g) || [])[0];
     if (cap) place_name = cap.trim();
   }
@@ -526,70 +581,9 @@ function formatAccommodationReply(listings) {
   return lines.join('\n');
 }
 
-// ---------------- OpenRouter (grounded) ----------------
-async function generateAIResponse(profile, studentMessage, conversationHistory = [], dataContext = '') {
-  const historyContext = conversationHistory.map(h => `User: ${h.message}\nAssistant: ${h.response}`).join('\n');
-
-  const systemPrompt = `
-You are a helpful Student Assistant.
-
-STYLE
-- Keep replies short, WhatsApp-like. 1–2 lines if simple; bullets for lists.
-- Prefer the "College Data Context" as the ONLY source for provider/course facts.
-
-STRICT RULES
-- Do NOT invent or guess UCAS codes, campuses, start dates, modes, or durations.
-- Do NOT output placeholders like [Campus Name], [Start Date], [UCAS code], or "Online or In-person".
-- If a field isn't present in the context, OMIT it entirely.
-- If the question cannot be answered from the context, say so briefly, then give general guidance (no placeholders).
-
-When listing a course, use only fields that exist: Title, Outcome, Mode, Duration, Campus, Start, UCAS.
-
-College Data Context:
-${dataContext || '(none)'}
-  `.trim();
-
-  const userPrompt = `
-Student Info:
-- Name: ${profile.name}
-- Interests: ${profile.interests}
-- Goals: ${profile.goals}
-- Country: ${profile.country}
-
-Recent Chat History:
-${historyContext}
-
-Student's Latest Question:
-"${studentMessage}"
-
-If data is missing, be brief and honest.
-  `.trim();
-
-  try {
-    const res = await axios.post(
-      'https://openrouter.ai/api/v1/chat/completions',
-      {
-        model: 'mistralai/mistral-7b-instruct',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
-        ],
-        max_tokens: 300,
-        temperature: 0.5
-      },
-      {
-        headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}`, 'Content-Type': 'application/json' },
-        timeout: 15000
-      }
-    );
-    return res.data?.choices?.[0]?.message?.content || "Sorry, I couldn't process that.";
-  } catch (error) {
-    console.error('AI API error:', error?.response?.data || error.message);
-    return "Sorry, I couldn't process that right now.";
-  }
-}
-
-// ---------------- Main entry ----------------
+/* ============================
+   Main entry (ALL Q&A → RAG → OpenRouter)
+============================= */
 async function getAIResponse(userId, rawMessage) {
   try {
     const uid = validateUserId(userId);
@@ -662,7 +656,7 @@ async function getAIResponse(userId, rawMessage) {
       return `Hey ${profile.name || 'there'} 👋 How can I help?`;
     }
 
-    // ==== Accommodation intent (UK real-time) ====
+    // ==== Accommodation (live lookups) ====
     if (ACCO_PATTERNS.test(lowerMsg)) {
       const prefs = parseAccommodationQuery(messageText);
       if (!prefs.place_name) {
@@ -677,24 +671,20 @@ async function getAIResponse(userId, rawMessage) {
       return reply;
     }
 
-    // ==== Data-first answering from providers file (now fuzzy & robust) ====
+    // ==== RAG over your dataset (always used for course/provider Qs) ====
     const retrieval = findRelevantData(messageText);
-    const direct = buildDirectAnswer(messageText, retrieval);
-    if (direct) {
-      // E.g., for your sample:
-      // • Accountancy and Business Management (MA (Hons)) – Full-time – 4 Years – Main Site – starts 15/09/2025 – UCAS: NN24
-      try { await saveConversation(uid, messageText, direct); } catch (_) {}
-      profile.conversationHistory.push({ message: messageText, response: direct, timestamp: new Date() });
-      if (profile.conversationHistory.length > 20) profile.conversationHistory.shift();
-      if (exists) { try { await updateUserInDB(uid, {}); } catch (_) {} }
-      return direct;
-    }
+    const ragContext = buildRAGContext(retrieval);
 
-    // ==== Fall back to OpenRouter with grounded context (no placeholders) ====
-    const dataCtx = buildDataContext(retrieval);
-    const aiReply = await generateAIResponse(profile, messageText, profile.conversationHistory.slice(-10), dataCtx);
+    // If no retrieval hits at all, still ask model to respond carefully (it will say not found + guidance)
+    const aiReply = await generateAIResponse(
+      profile,
+      messageText,
+      profile.conversationHistory.slice(-10),
+      ragContext
+    );
+
     const cleaned = sanitizeLLMReply(aiReply);
-    const finalReply = cleaned || "I don’t see that course in my dataset. Want me to check similar options or another provider?";
+    const finalReply = cleaned || "I don’t see that in my dataset. Want me to try similar subjects or another provider?";
 
     try { await saveConversation(uid, messageText, finalReply); } catch (_) {}
     profile.conversationHistory.push({ message: messageText, response: finalReply, timestamp: new Date() });
@@ -712,7 +702,9 @@ async function getAIResponse(userId, rawMessage) {
   }
 }
 
-// ---------------- Utilities ----------------
+/* ============================
+   Misc Utilities / Stats
+============================= */
 function clearUserData(userId) {
   try {
     const uid = validateUserId(userId);
@@ -738,7 +730,9 @@ async function getUserStats() {
   }
 }
 
-// ---------------- Exports ----------------
+/* ============================
+   Exports
+============================= */
 module.exports = {
   getAIResponse,
   clearUserData,
