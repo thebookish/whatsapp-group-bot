@@ -69,9 +69,26 @@ function scoreText(text, queryTerms) {
   return score;
 }
 
+// --- Synonym expansion to improve recall (accountancy→accounting etc.)
+function expandTerms(terms) {
+  const map = {
+    accountancy: 'accounting',
+    counsellor: 'counselor',
+    counselling: 'counseling',
+    'business management': 'business management'
+  };
+  const extra = [];
+  for (const t of terms) {
+    const k = t.toLowerCase();
+    if (map[k] && map[k] !== t) extra.push(map[k]);
+  }
+  return [...new Set([...terms, ...extra])];
+}
+
 function findRelevantData(query, opts = { topProviders: 2, topCourses: 4 }) {
   const providers = loadProvidersData();
-  const terms = norm(query).split(/[^a-z0-9&+]+/).filter(Boolean);
+  const baseTerms = norm(query).split(/[^a-z0-9&+]+/).filter(Boolean);
+  const terms = expandTerms(baseTerms);
 
   const providerRank = providers
     .map(p => {
@@ -103,14 +120,39 @@ function findRelevantData(query, opts = { topProviders: 2, topCourses: 4 }) {
   return { providers: providerRank.map(x => x.p), courses: courseRank.map(x => ({ provider: x.provider, course: x.course })) };
 }
 
+// --- Helpers for choosing the best option and formatting
+function parseDDMMYYYY(s) {
+  const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(s || '');
+  if (!m) return null;
+  const dd = parseInt(m[1], 10);
+  const mm = parseInt(m[2], 10);
+  const yyyy = parseInt(m[3], 10);
+  return new Date(yyyy, mm - 1, dd);
+}
+
+function pickBestOption(course) {
+  const opts = Array.isArray(course.options) ? course.options : [];
+  if (!opts.length) return null;
+  const dated = opts
+    .map(o => ({ o, dt: parseDDMMYYYY(o.startDate) }))
+    .sort((a, b) => {
+      if (!a.dt && !b.dt) return 0;
+      if (!a.dt) return 1;
+      if (!b.dt) return -1;
+      return a.dt - b.dt;
+    });
+  return (dated[0] && dated[0].o) || opts[0];
+}
+
 function formatCourseLine(providerName, course, opt) {
+  const o = opt || pickBestOption(course);
   const bits = [];
   bits.push(`• ${course.title}`);
-  if (opt?.outcome) bits.push(`(${opt.outcome})`);
-  if (opt?.studyMode) bits.push(`– ${opt.studyMode}`);
-  if (opt?.durationQty && opt?.durationType) bits.push(`– ${opt.durationQty} ${opt.durationType}`);
-  if (opt?.location) bits.push(`– ${opt.location}`);
-  if (opt?.startDate) bits.push(`– starts ${opt.startDate}`);
+  if (o?.outcome) bits.push(`(${o.outcome})`);
+  if (o?.studyMode) bits.push(`– ${o.studyMode}`);
+  if (o?.durationQty && o?.durationType) bits.push(`– ${o.durationQty} ${o.durationType}`);
+  if (o?.location) bits.push(`– ${o.location}`);
+  if (o?.startDate) bits.push(`– starts ${o.startDate}`);
   if (course.applicationCode) bits.push(`– UCAS: ${course.applicationCode}`);
   return bits.join(' ');
 }
@@ -129,18 +171,14 @@ function buildDirectAnswer(query, results) {
     const lines = [];
     lines.push(`For *${targetProvider.name}*:`);
     for (const c of chosen) {
-      const opt = c.options?.[0];
-      lines.push(formatCourseLine(targetProvider.name, c, opt));
+      lines.push(formatCourseLine(targetProvider.name, c));
     }
     if (targetProvider.websiteUrl) lines.push(`More info: ${targetProvider.websiteUrl}`);
     return lines.join('\n');
   }
 
   if (courses.length) {
-    return courses.slice(0, 4).map(({ provider, course }) => {
-      const opt = course.options?.[0];
-      return formatCourseLine(provider.name, course, opt);
-    }).join('\n');
+    return courses.slice(0, 4).map(({ provider, course }) => formatCourseLine(provider.name, course)).join('\n');
   }
 
   return '';
@@ -157,13 +195,13 @@ function buildDataContext(results) {
   }
 
   for (const { provider, course } of courses.slice(0, 6)) {
-    const o = course.options?.[0];
+    const o = pickBestOption(course);
     const bits = [
       `Course: ${course.title}`,
       provider?.name ? `Provider: ${provider.name}` : null,
       course.applicationCode ? `UCAS: ${course.applicationCode}` : null,
       o?.outcome ? `Outcome: ${o.outcome}` : null,
-      o?.studyMode ? `Mode: ${o.studyMode}` : null,
+      o?.studyMode ? `Mode: ${o?.studyMode}` : null,
       (o?.durationQty && o?.durationType) ? `Duration: ${o.durationQty} ${o.durationType}` : null,
       o?.location ? `Campus: ${o.location}` : null,
       o?.startDate ? `Start: ${o.startDate}` : null
@@ -171,6 +209,22 @@ function buildDataContext(results) {
     lines.push(bits.join(' | '));
   }
   return lines.join('\n');
+}
+
+// --- Sanitize any LLM output to remove placeholders or empty labels
+function sanitizeLLMReply(text) {
+  if (!text) return text;
+  let t = text.replace(/\[[^\]]+\]/g, ''); // remove [placeholders]
+  const lines = t.split(/\r?\n/).map(l => l.trim());
+  const filtered = lines.filter(l => {
+    if (!l) return false;
+    if (/Online or In[- ]?person/i.test(l)) return false;
+    if (/Campus:\s*$/i.test(l)) return false;
+    if (/Start:\s*$/i.test(l)) return false;
+    if (/UCAS code?:\s*$/i.test(l)) return false;
+    return true;
+  }).map(l => l.replace(/\s–\s*$/,''));
+  return filtered.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 // ---------------- Onboarding & App State ----------------
@@ -342,7 +396,6 @@ async function searchUKAccommodation({ place_name, price_max, bedrooms, page = 1
   };
   if (price_max) params.price_max = price_max;
   if (typeof bedrooms === 'number') {
-    // For 0 beds (studio), restrict bedroom_max=0; else set both min/max to bedrooms for tighter match
     if (bedrooms === 0) { params.bedroom_max = 0; }
     else { params.bedroom_min = bedrooms; params.bedroom_max = bedrooms; }
   }
@@ -372,8 +425,6 @@ async function searchUKAccommodation({ place_name, price_max, bedrooms, page = 1
 
 function formatAccommodationReply(listings, opts = {}) {
   if (!listings.length) return 'Couldn’t find live listings for that—try a nearby area or raise budget a bit?';
-
-  // WhatsApp-style: 4–6 concise lines
   const top = listings.slice(0, 5);
   const lines = top.map(l =>
     `• ${l.title} – ${l.price_formatted}${l.bedrooms != null ? `, ${l.bedrooms} bed` : ''}\n  ${l.address}${l.url ? `\n  ${l.url}` : ''}`
@@ -387,11 +438,19 @@ async function generateAIResponse(profile, studentMessage, conversationHistory =
 
   const systemPrompt = `
 You are a helpful Student Assistant.
-- Keep replies short and human, WhatsApp-like. 1–2 lines if simple; bullets for lists.
-- Use the provided "College Data Context" first. If not available, answer generally.
-- When listing a course: Title, Outcome, Mode, Duration, Campus, Start, UCAS code.
-- If user mentions a specific provider, prioritise it.
-- Avoid long paragraphs.
+
+STYLE
+- Keep replies short, WhatsApp-like. 1–2 lines if simple; bullets for lists.
+- Prefer the "College Data Context" as the ONLY source for provider/course facts.
+
+STRICT RULES
+- Do NOT invent or guess UCAS codes, campuses, start dates, modes, or durations.
+- Do NOT output placeholders like [Campus Name], [Start Date], [UCAS code], or "Online or In-person".
+- If a field isn't present in the context, OMIT it entirely.
+- If the question cannot be answered from the context, say so briefly, then give general guidance (no placeholders).
+
+When listing a course, use only fields that exist: Title, Outcome, Mode, Duration, Campus, Start, UCAS.
+
 College Data Context:
 ${dataContext || '(none)'}
   `.trim();
@@ -515,9 +574,8 @@ async function getAIResponse(userId, rawMessage) {
       if (!prefs.place_name) {
         return `Tell me the city/area + budget, e.g. "1 bed under £900 in Manchester".`;
       }
-      const { listings, meta } = await searchUKAccommodation(prefs);
+      const { listings } = await searchUKAccommodation(prefs);
       const reply = formatAccommodationReply(listings);
-      // Save conversation
       try { await saveConversation(uid, messageText, reply); } catch (_) {}
       profile.conversationHistory.push({ message: messageText, response: reply, timestamp: new Date() });
       if (profile.conversationHistory.length > 20) profile.conversationHistory.shift();
@@ -536,16 +594,18 @@ async function getAIResponse(userId, rawMessage) {
       return direct;
     }
 
-    // ==== Fall back to OpenRouter with grounded context ====
+    // ==== Fall back to OpenRouter with grounded context (no placeholders) ====
     const dataCtx = buildDataContext(retrieval);
     const aiReply = await generateAIResponse(profile, messageText, profile.conversationHistory.slice(-10), dataCtx);
+    const cleaned = sanitizeLLMReply(aiReply);
+    const finalReply = cleaned || "I don’t have those specifics in my course data yet. Want me to check other providers?";
 
-    try { await saveConversation(uid, messageText, aiReply); } catch (_) {}
-    profile.conversationHistory.push({ message: messageText, response: aiReply, timestamp: new Date() });
+    try { await saveConversation(uid, messageText, finalReply); } catch (_) {}
+    profile.conversationHistory.push({ message: messageText, response: finalReply, timestamp: new Date() });
     if (profile.conversationHistory.length > 20) profile.conversationHistory.shift();
     if (exists) { try { await updateUserInDB(uid, {}); } catch (_) {} }
 
-    return aiReply;
+    return finalReply;
 
   } catch (error) {
     console.error('getAIResponse error:', error.message);
