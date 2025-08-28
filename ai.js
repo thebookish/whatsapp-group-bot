@@ -371,8 +371,9 @@ async function getAIResponse(userId, rawMessage) {
     }
 
     // ==== RAG over your dataset (course/provider Qs) ====
-    const retrieval = findRelevantData(messageText);
-    const ragContext = buildRAGContext(retrieval);
+ const retrieval = await findRelevantData(messageText);
+const ragContext = buildRAGContext(retrieval);
+
 
     const aiReply = await generateAIResponse(
       profile,

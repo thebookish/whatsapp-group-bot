@@ -1,289 +1,134 @@
-// rag.js
-
 const fs = require('fs');
-const { DATA_FILE, ensureHttps } = require('./config');
+const zlib = require('zlib');
+const path = require('path');
+const { chain } = require('stream-chain');
+const { parser } = require('stream-json');
+const { streamArray } = require('stream-json/streamers/StreamArray');
+const { DATA_FILE } = require('./config');
 
-/* ============================
-   Dataset (providers_with_courses.json)
-============================= */
-let PROVIDERS_CACHE = null;
-
-function loadProvidersData() {
-  if (PROVIDERS_CACHE) return PROVIDERS_CACHE;
-  try {
-    const raw = fs.readFileSync(DATA_FILE, 'utf8');
-    const parsed = JSON.parse(raw || '{}');
-
-    // Input format is an object keyed by providerId
-    PROVIDERS_CACHE = Object.values(parsed || {}).map(p => ({
-      id: p.id,
-      name: p.name || p.aliasName || '',
-      institutionCode: p.institutionCode || '',
-      providerSort: p.providerSort || '',
-      websiteUrl: ensureHttps(p.websiteUrl || ''),
-      logoUrl: p.logoUrl || '',
-      address: p.address || {},
-      aliases: Array.isArray(p.aliases) ? p.aliases : [],
-      aboutUs: p.aboutUs || '',
-      whatMakesUsDifferent: p.whatMakesUsDifferent || '',
-      courseLocations: p.courseLocations || [],
-      courses: (p.courses || []).map(c => ({
-        id: c.id,
-        academicYearId: c.academicYearId || '',
-        title: c.courseTitle || '',
-        destination: c.routingData?.destination?.caption || '',
-        applicationCode: c.applicationCode || null,
-        options: (c.options || []).map(o => ({
-          id: o.id,
-          studyMode: o.studyMode?.mappedCaption || o.studyMode?.caption || '',
-          durationQty: o.duration?.quantity ?? null,
-          durationType: o.duration?.durationType?.caption || '',
-          location: o.location?.name || '',
-          startDate: o.startDate?.date || '',
-          outcome: o.outcomeQualification?.caption || '',
-        }))
-      }))
-    }));
-  } catch (err) {
-    console.error('Failed to load providers_with_courses.json:', err.message);
-    PROVIDERS_CACHE = [];
-  }
-  return PROVIDERS_CACHE;
-}
-
-/* ============================
-   Retrieval (fuzzy + UCAS aware)
-============================= */
+/**
+ * Normalize text for cheap scoring
+ */
 function normBase(s) {
   return (s || '')
     .toString()
-    .normalize('NFKD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/&/g, ' and ')
-    .replace(/[-/_,.()+]/g, ' ')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
     .replace(/\s+/g, ' ')
-    .trim()
-    .toLowerCase();
-}
-const STOP = new Set([
-  'the','a','an','with','and','of','for','in','to','at','on','about','into','from','by',
-  'course','degree','program','programme','pg','ug','undergraduate','postgraduate'
-]);
-function tokenize(s) {
-  if (!s) return [];
-  return normBase(s).split(/\s+/).filter(t => t && !STOP.has(t));
-}
-function jaccard(a, b) {
-  const A = new Set(a);
-  const B = new Set(b);
-  const inter = [...A].filter(x => B.has(x)).length;
-  const uni = new Set([...A, ...B]).size || 1;
-  return inter / uni;
-}
-function expandTerms(terms) {
-  const map = {
-    accountancy: 'accounting',
-    accounts: 'accounting',
-    acct: 'accounting',
-    cs: 'computer science',
-    comp: 'computing',
-    'comp sci': 'computer science',
-    counselling: 'counseling',
-    counsellor: 'counselor',
-    mgmt: 'management',
-    biz: 'business',
-    bms: 'business management',
-    'software development': 'software',
-    'software engineering': 'software',
-    'business administration': 'business management',
-    ai: 'artificial intelligence',
-    data: 'data science'
-  };
-  const extra = [];
-  for (const t of terms) {
-    const k = t.toLowerCase();
-    if (map[k]) for (const w of map[k].split(' ')) extra.push(w);
-  }
-  return [...new Set([...terms, ...extra])];
-}
-function ucascodesFromQuery(q) {
-  const codes = [];
-  const re = /\b([a-z0-9]{4})\b/ig;
-  let m;
-  while ((m = re.exec(q || '')) !== null) codes.push(m[1].toUpperCase());
-  return codes;
-}
-function computeProviderScore(provider, qTokens) {
-  const pTokens = new Set([
-    ...tokenize(provider.name),
-    ...tokenize(provider.institutionCode),
-    ...tokenize(provider.providerSort),
-    ...tokenize(provider.aboutUs),
-    ...tokenize(provider.whatMakesUsDifferent),
-    ...((provider.aliases || []).flatMap(a => tokenize(a))),
-    ...((provider.courseLocations || []).flatMap(l => tokenize(`${l.title} ${l.address}`))),
-    ...tokenize(provider.address?.line4 || ''),
-    ...tokenize(provider.address?.country?.mappedCaption || '')
-  ]);
-  const overlap = [...pTokens].filter(t => qTokens.includes(t)).length;
-  return overlap;
-}
-function computeCourseScore(provider, course, qTokens, qUCAS) {
-  const titleTokens = tokenize(course.title);
-  const optionStrings = (course.options || []).map(o =>
-    `${o.studyMode} ${o.durationQty} ${o.durationType} ${o.location} ${o.startDate} ${o.outcome}`
-  );
-  const textTokens = new Set([
-    ...titleTokens,
-    ...tokenize(course.destination),
-    ...tokenize(provider.name),
-    ...tokenize(provider.institutionCode),
-    ...tokenize(provider.address?.line4 || ''),
-    ...tokenize(provider.address?.country?.mappedCaption || ''),
-    ...optionStrings.flatMap(s => tokenize(s))
-  ]);
-
-  const overlap = [...textTokens].filter(t => qTokens.includes(t));
-  const jTitle = jaccard(titleTokens, qTokens);
-
-  const ucasBonus = (course.applicationCode && qUCAS.includes(course.applicationCode.toUpperCase())) ? 15 : 0;
-
-  let keywordBoost = 0;
-  const kws = new Set(['java','python','software','computing','computer','science','accounting','accountancy','business','management','data','ai','artificial','intelligence']);
-  for (const t of overlap) if (kws.has(t)) keywordBoost += 1.5;
-
-  const score =
-    12 * jTitle +
-    3 * overlap.length +
-    2 * computeProviderScore(provider, qTokens) +
-    ucasBonus +
-    keywordBoost;
-
-  const hardGate = jTitle >= 0.2 || overlap.length >= 2 || ucasBonus > 0;
-  return hardGate ? score : 0;
-}
-function findRelevantData(query, opts = { topProviders: 3, topCourses: 8 }) {
-  const providers = loadProvidersData();
-  const baseTokens = tokenize(query);
-  const qTokens = expandTerms(baseTokens);
-  const qText = normBase(query);
-  const qUCAS = ucascodesFromQuery(qText);
-
-  // Providers (soft)
-  const provScored = providers
-    .map(p => ({ p, score: computeProviderScore(p, qTokens) }))
-    .filter(x => x.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, opts.topProviders);
-
-  // Courses (fuzzy across ALL providers)
-  const courses = [];
-  for (const pv of providers) {
-    for (const c of pv.courses) {
-      const score = computeCourseScore(pv, c, qTokens, qUCAS);
-      if (score > 0) courses.push({ provider: pv, course: c, score });
-    }
-  }
-  const courseRank = courses.sort((a, b) => b.score - a.score).slice(0, opts.topCourses);
-
-  return {
-    providers: provScored.map(x => x.p),
-    courses: courseRank.map(x => ({ provider: x.provider, course: x.course }))
-  };
+    .trim();
 }
 
-/* ============================
-   Option Picking / Formatting
-============================= */
-function parseDDMMYYYY(s) {
-  const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(s || '');
-  if (!m) return null;
-  const dd = parseInt(m[1], 10);
-  const mm = parseInt(m[2], 10);
-  const yyyy = parseInt(m[3], 10);
-  return new Date(yyyy, mm - 1, dd);
+/**
+ * Open a readable stream for JSON array file (supports .json or .json.gz)
+ * The file is expected to be a top-level JSON array of course/provider objects.
+ */
+function openJsonArrayStream(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  const base = ext === '.gz' ? path.basename(filePath, ext) : path.basename(filePath);
+  const isGzip = filePath.endsWith('.gz');
+
+  const rs = fs.createReadStream(filePath);
+  const pipeline = [];
+
+  if (isGzip) pipeline.push(zlib.createGunzip());
+  pipeline.push(parser());        // parse tokens
+  pipeline.push(streamArray());   // iterate over array items
+
+  return chain([rs, ...pipeline]);
 }
-function pickBestOption(course) {
-  const opts = Array.isArray(course.options) ? course.options : [];
-  if (!opts.length) return null;
-  const dated = opts
-    .map(o => ({ o, dt: parseDDMMYYYY(o.startDate) }))
-    .sort((a, b) => {
-      if (!a.dt && !b.dt) return 0;
-      if (!a.dt) return 1;
-      if (!b.dt) return -1;
-      return a.dt - b.dt;
+
+/**
+ * Stream through the dataset and collect top matches by a trivial score.
+ * This avoids loading the entire file into memory.
+ */
+async function findRelevantData(query, opts = {}) {
+  const { max = 20 } = opts;
+  const q = normBase(query);
+  if (!q) return [];
+
+  const terms = q.split(' ').filter(Boolean);
+  const scores = [];
+  const stream = openJsonArrayStream(DATA_FILE);
+
+  // NOTE: Adjust these keys to whatever fields exist in your dataset
+  const TEXT_FIELDS = ['course_title', 'provider_name', 'subject', 'campus', 'mode', 'summary', 'description'];
+
+  return await new Promise((resolve, reject) => {
+    stream.on('data', ({ value }) => {
+      try {
+        // value = one record from the array
+        const blob = TEXT_FIELDS.map(k => value?.[k] ?? '').join(' ');
+        const nb = normBase(blob);
+        if (!nb) return;
+
+        // simple score = #term hits
+        let score = 0;
+        for (const t of terms) {
+          if (t.length < 2) continue;
+          const hits = nb.split(t).length - 1;
+          score += hits;
+        }
+        if (score > 0) {
+          // Keep a small top list in memory
+          scores.push({ score, item: value });
+          if (scores.length > max * 5) {
+            scores.sort((a, b) => b.score - a.score);
+            scores.length = max * 3; // prune aggressively
+          }
+        }
+      } catch {
+        // ignore bad rows
+      }
     });
-  return (dated[0] && dated[0].o) || opts[0];
+
+    stream.on('end', () => {
+      scores.sort((a, b) => b.score - a.score);
+      const top = scores.slice(0, max).map(x => x.item);
+      resolve(top);
+    });
+
+    stream.on('error', reject);
+  });
 }
 
-/* ============================
-   RAG Context Construction
-============================= */
-function buildRAGContext(results) {
-  const { providers, courses } = results;
-  const chunks = [];
+/**
+ * Build a small text context for the LLM from the retrieved records.
+ * Only include fields you really need to keep tokens down.
+ */
+function buildRAGContext(records = []) {
+  const lines = records.map((r, i) => {
+    const title = r.course_title || r.title || 'Course';
+    const provider = r.provider_name || r.provider || '';
+    const mode = r.mode || '';
+    const duration = r.duration || '';
+    const campus = r.campus || '';
+    const start = r.start_date || r.start || '';
+    const ucas = r.ucas || r.ucas_code || '';
 
-  // Provider chunks
-  for (const p of providers.slice(0, 3)) {
-    const location = [p.address?.line4, p.address?.country?.mappedCaption].filter(Boolean).join(', ');
-    const lines = [
-      `--- RAG_CHUNK: PROVIDER`,
-      `Provider: ${p.name}`,
-      `Institution Code: ${p.institutionCode || '(not listed)'}`,
-      location ? `Location: ${location}` : null,
-      p.websiteUrl ? `Website: ${p.websiteUrl}` : null,
-      p.aliases?.length ? `Aliases: ${p.aliases.join(', ')}` : null
-    ].filter(Boolean);
-    chunks.push(lines.join('\n'));
-  }
+    return [
+      `#${i + 1} ${title}${provider ? ` – ${provider}` : ''}`,
+      mode ? `Mode: ${mode}` : null,
+      duration ? `Duration: ${duration}` : null,
+      campus ? `Campus: ${campus}` : null,
+      start ? `Start: ${start}` : null,
+      ucas ? `UCAS: ${ucas}` : null,
+    ].filter(Boolean).join(' | ');
+  });
 
-  // Course chunks
-  for (const { provider, course } of courses.slice(0, 10)) {
-    const o = pickBestOption(course) || {};
-    const fields = [
-      `--- RAG_CHUNK: COURSE`,
-      `Course Title: ${course.title}`,
-      `Provider: ${provider.name}`,
-      course.destination ? `Level: ${course.destination}` : null,
-      course.applicationCode ? `UCAS: ${course.applicationCode}` : null,
-      o.outcome ? `Outcome: ${o.outcome}` : null,
-      o.studyMode ? `Mode: ${o.studyMode}` : null,
-      (o.durationQty && o.durationType) ? `Duration: ${o.durationQty} ${o.durationType}` : null,
-      o.location ? `Campus: ${o.location}` : null,
-      o.startDate ? `Start: ${o.startDate}` : null
-    ].filter(Boolean);
-    chunks.push(fields.join('\n'));
-  }
-
-  if (!chunks.length) return '(none — no relevant courses/providers found for this query)';
-  return chunks.join('\n\n');
+  return lines.join('\n');
 }
 
-/* ============================
-   Output Sanitizer
-============================= */
-function sanitizeLLMReply(text) {
-  if (!text) return text;
-  let t = text.replace(/\[[^\]]+\]/g, ''); // remove [placeholders]
-  const lines = t.split(/\r?\n/).map(l => l.trim());
-  const filtered = lines.filter(l => {
-    if (!l) return false;
-    if (/Online or In[- ]?person/i.test(l)) return false;
-    if (/Campus:\s*$/i.test(l)) return false;
-    if (/Start:\s*$/i.test(l)) return false;
-    if (/UCAS code?:\s*$/i.test(l)) return false;
-    return true;
-  }).map(l => l.replace(/\s–\s*$/,''));
-  return filtered.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+/**
+ * Optional: clean up reply text (you already had something like this)
+ */
+function sanitizeLLMReply(s) {
+  if (!s || typeof s !== 'string') return '';
+  return s.replace(/\s+$/g, '').trim();
 }
 
 module.exports = {
-  loadProvidersData,
-  findRelevantData,
+  findRelevantData,   // now ASYNC
   buildRAGContext,
   sanitizeLLMReply,
-  // Exported utilities in case you need them elsewhere
-  tokenize,
-  normBase,
+  normBase
 };
