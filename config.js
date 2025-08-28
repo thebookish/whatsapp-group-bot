@@ -18,4 +18,8 @@ supabase,
 OPENROUTER_API_KEY,
 DATA_FILE,
 NESTORIA_ENDPOINT
+<<<<<<< HEAD
 };
+=======
+};
+>>>>>>> 3f10d8c (fix issue)
