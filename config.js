@@ -17,5 +17,6 @@ module.exports = {
 supabase,
 OPENROUTER_API_KEY,
 DATA_FILE,
-NESTORIA_ENDPOINT
+NESTORIA_ENDPOINT,
+DATA_ARRAY_KEY: process.env.DATA_ARRAY_KEY || 'records',
 };
