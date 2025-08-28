@@ -5,7 +5,8 @@ const path = require('path');
 const { chain } = require('stream-chain');
 const { parser } = require('stream-json');
 const { streamArray } = require('stream-json/streamers/StreamArray');
-const { DATA_FILE } = require('./config');
+const { pick } = require('stream-json/filters/Pick');
+const { DATA_FILE, DATA_ARRAY_KEY } = require('./config');
 
 /** =========================
  *  Normalization + Helpers
@@ -18,45 +19,56 @@ function normBase(s) {
     .replace(/\s+/g, ' ')
     .trim();
 }
-
 function tokenize(nb) {
-  if (!nb) return [];
-  // Keep tokens >= 2 chars to match your previous logic
-  return nb.split(' ').filter(t => t && t.length >= 2);
+  return nb ? nb.split(' ').filter(t => t && t.length >= 2) : [];
 }
 
-/** Fields you search across (make sure these match your dataset) */
+/** Fields to search across (align with your dataset) */
 const TEXT_FIELDS = ['course_title', 'provider_name', 'subject', 'campus', 'mode', 'summary', 'description'];
-/** Fields you keep for response building */
-const SLIM_FIELDS = ['course_title', 'provider_name', 'mode', 'duration', 'campus', 'start_date', 'ucas', 'ucas_code', 'title', 'provider', 'start'];
+/** Fields to keep for building responses (lean footprint) */
+const SLIM_FIELDS = [
+  'course_title', 'provider_name', 'mode', 'duration', 'campus',
+  'start_date', 'ucas', 'ucas_code', 'title', 'provider', 'start'
+];
 
 /** =========================
- *  Streaming JSON Array
- *  ========================= */
-function openJsonArrayStream(filePath) {
-  const isGzip = filePath.endsWith('.gz');
+ *  Stream a JSON array
+ *  =========================
+ *  Supports:
+ *   - Top-level array: [ {...}, {...} ]
+ *   - Object with array at a known key: { "records": [ ... ] }
+ */
+function openJsonArrayStream(filePath, arrayKey) {
+  const isGzip = filePath.toLowerCase().endsWith('.gz');
   const rs = fs.createReadStream(filePath);
   const pipeline = [];
+
   if (isGzip) pipeline.push(zlib.createGunzip());
   pipeline.push(parser());
+
+  if (arrayKey && typeof arrayKey === 'string' && arrayKey.trim()) {
+    // Dive into the object key that holds the array
+    pipeline.push(pick({ filter: arrayKey }));
+  }
+  // Now we should be positioned at the array to stream its items
   pipeline.push(streamArray());
+
   return chain([rs, ...pipeline]);
 }
 
 /** =========================
  *  In-Memory Index
  *  =========================
- *  POSTINGS: Map<string, number[]>        // term -> sorted list of docIDs
+ *  POSTINGS: Map<string, number[]>         // term -> docIDs
  *  RECORDS: Array<{ idx:number, nb:string, ...slim }>
  */
 let INDEX_READY_PROMISE = null;
 let POSTINGS = null;
 let RECORDS = null;
 
-// Small LRU for query -> result caching (by normalized query)
+// Tiny LRU for normalized query → results
 const QUERY_CACHE = new Map();
 const QUERY_CACHE_MAX = 200;
-
 function lruGet(key) {
   if (!QUERY_CACHE.has(key)) return undefined;
   const val = QUERY_CACHE.get(key);
@@ -73,27 +85,26 @@ function lruSet(key, val) {
 }
 
 /**
- * Build the index exactly once by streaming the dataset.
- * We keep a compact normalized blob per record and an inverted index of terms.
+ * Build the inverted index once by streaming the dataset.
+ * Works for top-level arrays or arrays under DATA_ARRAY_KEY.
  */
 async function buildIndex() {
   if (INDEX_READY_PROMISE) return INDEX_READY_PROMISE;
+
   INDEX_READY_PROMISE = (async () => {
     POSTINGS = new Map();
     RECORDS = [];
 
-    const stream = openJsonArrayStream(DATA_FILE);
+    const stream = openJsonArrayStream(DATA_FILE, DATA_ARRAY_KEY);
     let idx = 0;
 
     await new Promise((resolve, reject) => {
       stream.on('data', ({ value }) => {
         try {
-          // Create normalized blob for search
           const blob = TEXT_FIELDS.map(k => value?.[k] ?? '').join(' ');
           const nb = normBase(blob);
           if (!nb) { idx++; return; }
 
-          // Keep only slim fields for downstream context building
           const slim = {};
           for (const f of SLIM_FIELDS) if (value?.[f] != null) slim[f] = value[f];
           slim.idx = idx;
@@ -101,56 +112,54 @@ async function buildIndex() {
 
           RECORDS.push(slim);
 
-          // Build term set per document (avoid duplicate docIDs per term)
           const terms = new Set(tokenize(nb));
           for (const t of terms) {
             let list = POSTINGS.get(t);
             if (!list) { list = []; POSTINGS.set(t, list); }
-            // Keep postings sorted by pushing increasing idx
-            // (idx increases monotonically as we stream)
             list.push(idx);
           }
           idx++;
         } catch {
-          idx++;
-          // ignore malformed rows
+          idx++; // skip malformed row, keep index advancing
         }
       });
 
       stream.on('end', resolve);
-      stream.on('error', reject);
+      stream.on('error', (err) => {
+        // Helpful hint when top-level isn't an array and no key provided
+        if (!DATA_ARRAY_KEY) {
+          reject(new Error(
+            `Failed to stream JSON array. If your file is an object like { "records": [...] }, set DATA_ARRAY_KEY="records". Original: ${err.message}`
+          ));
+        } else {
+          reject(err);
+        }
+      });
     });
   })();
 
   return INDEX_READY_PROMISE;
 }
 
-/** =========================
- *  Query using the index
- *  ========================= */
 function scoreDocByHits(doc, terms) {
-  // Same cheap scoring you used: sum of term hit counts in the normalized blob.
-  // nb.split(t).length - 1 per term (avoid regex overhead).
   let score = 0;
   const nb = doc.nb;
   for (const t of terms) {
     if (t.length < 2) continue;
-    const hits = nb.split(t).length - 1;
+    const hits = nb.split(t).length - 1; // fast substring count
     score += hits;
   }
   return score;
 }
 
 /**
- * Indexed retrieval: uses POSTINGS to get candidates, then cheap scoring.
- * Returns slim records (without nb) limited to {max}.
+ * Indexed retrieval (no full file rescans on each query).
  */
 async function findRelevantData(query, opts = {}) {
   const { max = 20 } = opts;
   const q = normBase(query);
   if (!q) return [];
 
-  // build index lazily once
   await buildIndex();
 
   const cached = lruGet(q);
@@ -159,8 +168,7 @@ async function findRelevantData(query, opts = {}) {
   const terms = tokenize(q);
   if (!terms.length) return [];
 
-  // Collect candidates via postings union
-  // candidateCounts[docId] = number of query terms that appear in doc
+  // Collect candidate doc IDs from postings (union)
   const candidateCounts = new Map();
   for (const t of terms) {
     const posting = POSTINGS.get(t);
@@ -172,20 +180,18 @@ async function findRelevantData(query, opts = {}) {
   }
   if (candidateCounts.size === 0) return [];
 
-  // Fast pre-prune: keep docs that matched at least one term, then score precisely
-  // Turn into array of doc refs
+  // Materialize candidates and score
   const candidates = [];
   for (const docId of candidateCounts.keys()) {
     const doc = RECORDS[docId];
     if (doc) candidates.push(doc);
   }
 
-  // Score and rank
   const scored = candidates.map(doc => ({ score: scoreDocByHits(doc, terms), doc }));
   scored.sort((a, b) => b.score - a.score);
+
   const top = scored.slice(0, max).map(({ doc }) => {
-    // strip nb from the returned item
-    const { nb, ...rest } = doc;
+    const { nb, ...rest } = doc; // strip search blob
     return rest;
   });
 
@@ -194,7 +200,7 @@ async function findRelevantData(query, opts = {}) {
 }
 
 /** =========================
- *  Context Builder & Cleaners
+ *  Context Builder & Cleaner
  *  ========================= */
 function buildRAGContext(records = []) {
   const lines = records.map((r, i) => {
@@ -205,7 +211,6 @@ function buildRAGContext(records = []) {
     const campus = r.campus || '';
     const start = r.start_date || r.start || '';
     const ucas = r.ucas || r.ucas_code || '';
-
     return [
       `#${i + 1} ${title}${provider ? ` – ${provider}` : ''}`,
       mode ? `Mode: ${mode}` : null,
@@ -215,7 +220,6 @@ function buildRAGContext(records = []) {
       ucas ? `UCAS: ${ucas}` : null,
     ].filter(Boolean).join(' | ');
   });
-
   return lines.join('\n');
 }
 
@@ -225,7 +229,7 @@ function sanitizeLLMReply(s) {
 }
 
 module.exports = {
-  findRelevantData,   // now uses an in-memory index (built once)
+  findRelevantData,
   buildRAGContext,
   sanitizeLLMReply,
   normBase
