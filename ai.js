@@ -1,7 +1,7 @@
 // ai.js
 const axios = require('axios');
 const { supabase, OPENROUTER_API_KEY, NESTORIA_ENDPOINT } = require('./config');
-const { findRelevantData, sanitizeLLMReply, normBase } = require('./rag');
+const { findRelevantData, sanitizeLLMReply, normBase, queryDataset } = require('./rag');
 
 /* ============================
    Onboarding & App State
@@ -211,42 +211,33 @@ function formatAccommodationReply(listings) {
 }
 
 /* ============================
-   Course Suggestion (dataset-first)
+   Analytics Formatter
 ============================= */
+function formatAnalyticReply(result) {
+  if (!result) return 'Not found in dataset.';
+  const head = result.text || '';
+  if (!result.rows || !result.rows.length) return head || 'Not found in dataset.';
 
-/** Build neat lines: University — Course — Start (if present) */
-function buildCourseLinesFromRecords(records, limit = 6) {
-  const lines = [];
-  for (const r of records) {
-    if (lines.length >= limit) break;
-    const uni = r.provider_name || r.provider || '';
-    const course = r.course_title || r.title || '';
-    const start = r.start_date || r.start || '';
-    if (!uni || !course) continue;
-    lines.push(start ? `${uni} — ${course} — starts ${start}` : `${uni} — ${course}`);
+  const previewLines = [];
+  const limit = 6;
+  for (const r of result.rows.slice(0, limit)) {
+    const uni = r.raw?.provider_name || r.provider_name || '';
+    const title = r.raw?.course_title || r.course_title || '';
+    const start = r.raw?.start_date_raw || r.start_date || '';
+    const qual = r.raw?.qualification || '';
+    const line = [
+      uni && title ? `${uni} — ${title}` : (title || uni || 'Course'),
+      qual ? `(${qual})` : null,
+      start ? `starts ${start}` : null
+    ].filter(Boolean).join(' — ');
+    previewLines.push(`• ${line}`);
   }
-  return lines;
-}
-
-function answerFromDataset(records) {
-  const lines = buildCourseLinesFromRecords(records, 6);
-  if (lines.length) return lines.join('\n');
-  return 'Not listed in my dataset.';
-}
-
-/** Simple generic fallback (no web). */
-function genericSubjectFromMessage(msg) {
-  const m = msg.match(/(?:on|in|for)\s+(.+)$/i);
-  if (m && m[1]) return m[1].trim();
-  return msg.trim();
-}
-function answerGeneric(subject) {
-  // Keep this concise and useful without external calls
-  return `I don’t see that in my dataset. For ${subject}, check top UK universities’ course pages (e.g., Oxford, Cambridge, Imperial, UCL, Edinburgh) and look for upcoming intakes. I can also try a nearby subject or different keyword if you want.`;
+  const preview = previewLines.join('\n');
+  return head ? `${head}\n${preview}` : preview;
 }
 
 /* ============================
-   (Optional) LLM kept for future (not needed for dataset answers)
+   (Optional) LLM kept for future
 ============================= */
 async function generateAIResponse(profile, studentMessage, conversationHistory = [], ragContext = '') {
   const historyContext = conversationHistory
@@ -254,9 +245,9 @@ async function generateAIResponse(profile, studentMessage, conversationHistory =
     .join('\n');
 
   const systemPrompt = `
-You are a helpful Student Assistant for UK courses. Keep answers short and natural.
+You are a helpful Student Assistant. Keep answers short and natural.
 Only rely on the context below for factual course details.
-If missing, say "Not listed in my dataset."
+If missing, answer generally"
 
 RAG College Data Context:
 ${ragContext}
@@ -395,10 +386,10 @@ async function getAIResponse(userId, rawMessage) {
       return reply;
     }
 
-    // ==== Dataset-first course suggestion ====
-    const retrieval = await findRelevantData(messageText);
-    if (retrieval && retrieval.length) {
-      const reply = answerFromDataset(retrieval);
+    // ==== Dataset-first (now analytical over full JSON) ====
+    const result = await queryDataset(messageText, { max: 200 });
+    if (result && (result.rows?.length || result.count !== undefined)) {
+      const reply = formatAnalyticReply(result);
       try { await saveConversation(uid, messageText, reply); } catch (_) {}
       profile.conversationHistory.push({ message: messageText, response: reply, timestamp: new Date() });
       if (profile.conversationHistory.length > 20) profile.conversationHistory.shift();
@@ -407,8 +398,8 @@ async function getAIResponse(userId, rawMessage) {
     }
 
     // ==== Generic fallback (no web) ====
-    const subject = genericSubjectFromMessage(messageText) || 'this subject';
-    const genericReply = answerGeneric(subject);
+    const subject = messageText;
+    const genericReply = `I don’t know exactly about this. For ${subject}, check top UK universities’ course pages (e.g., Oxford, Cambridge, Imperial, UCL, Edinburgh) and look for upcoming intakes. I can also try a nearby subject or different keyword if you want.`;
     try { await saveConversation(uid, messageText, genericReply); } catch (_) {}
     profile.conversationHistory.push({ message: messageText, response: genericReply, timestamp: new Date() });
     if (profile.conversationHistory.length > 20) profile.conversationHistory.shift();
