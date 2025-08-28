@@ -1,13 +1,13 @@
 // ai.js
 const axios = require('axios');
 const { supabase, OPENROUTER_API_KEY, NESTORIA_ENDPOINT } = require('./config');
-const { findRelevantData, buildRAGContext, sanitizeLLMReply, normBase } = require('./rag');
+const { findRelevantData, sanitizeLLMReply, normBase } = require('./rag');
 
 /* ============================
    Onboarding & App State
 ============================= */
 const ONBOARDING_STEPS = { NAME: 1, INTERESTS: 2, GOALS: 3, COUNTRY: 4, COMPLETE: 0 };
-const GREETING_PATTERNS = /\b(hello|hi|hey|start|begin)\b/i;
+const GREETING_PATTERNS = /\b(hello|hi|hey)\b/i;
 const ACCO_PATTERNS = /\b(accommodation|accomodation|accommodation|rent|room|flat|house|hall|student hall|dorm|hostel)\b/i;
 
 const activeSessions = new Map();
@@ -211,7 +211,42 @@ function formatAccommodationReply(listings) {
 }
 
 /* ============================
-   OpenRouter (RAG-grounded)
+   Course Suggestion (dataset-first)
+============================= */
+
+/** Build neat lines: University — Course — Start (if present) */
+function buildCourseLinesFromRecords(records, limit = 6) {
+  const lines = [];
+  for (const r of records) {
+    if (lines.length >= limit) break;
+    const uni = r.provider_name || r.provider || '';
+    const course = r.course_title || r.title || '';
+    const start = r.start_date || r.start || '';
+    if (!uni || !course) continue;
+    lines.push(start ? `${uni} — ${course} — starts ${start}` : `${uni} — ${course}`);
+  }
+  return lines;
+}
+
+function answerFromDataset(records) {
+  const lines = buildCourseLinesFromRecords(records, 6);
+  if (lines.length) return lines.join('\n');
+  return 'Not listed in my dataset.';
+}
+
+/** Simple generic fallback (no web). */
+function genericSubjectFromMessage(msg) {
+  const m = msg.match(/(?:on|in|for)\s+(.+)$/i);
+  if (m && m[1]) return m[1].trim();
+  return msg.trim();
+}
+function answerGeneric(subject) {
+  // Keep this concise and useful without external calls
+  return `I don’t see that in my dataset. For ${subject}, check top UK universities’ course pages (e.g., Oxford, Cambridge, Imperial, UCL, Edinburgh) and look for upcoming intakes. I can also try a nearby subject or different keyword if you want.`;
+}
+
+/* ============================
+   (Optional) LLM kept for future (not needed for dataset answers)
 ============================= */
 async function generateAIResponse(profile, studentMessage, conversationHistory = [], ragContext = '') {
   const historyContext = conversationHistory
@@ -219,21 +254,13 @@ async function generateAIResponse(profile, studentMessage, conversationHistory =
     .join('\n');
 
   const systemPrompt = `
-You are a helpful Student Assistant focused on UK university providers and courses.
-
-STYLE:
-- Keep replies short, WhatsApp-like. 1–2 lines if simple; bullets for lists.
-- Prioritize course-level matches first; include provider when useful.
-
-STRICT RULES:
-- Use ONLY the "RAG College Data Context" below for facts (providers, UCAS codes, campuses, start dates, modes, durations).
-- If a field is not present in the context, do NOT invent it. Say: "Not listed in my dataset."
-- No placeholders like [Campus], [Date], etc.
-- If no relevant items exist in RAG context, say briefly that it's not in the dataset and give general guidance (e.g., try related subjects or nearby providers).
+You are a helpful Student Assistant for UK courses. Keep answers short and natural.
+Only rely on the context below for factual course details.
+If missing, say "Not listed in my dataset."
 
 RAG College Data Context:
 ${ragContext}
-  `.trim();
+`.trim();
 
   const userPrompt = `
 Student Info:
@@ -248,10 +275,8 @@ ${historyContext}
 Student's Latest Question:
 "${studentMessage}"
 
-Respond grounded in the dataset above. Prefer bullets like:
-• <Course Title> (Outcome) – <Mode> – <Duration> – <Campus> – starts <DD/MM/YYYY> – UCAS: <Code>
-Include only the fields present in the RAG context.
-  `.trim();
+Respond plainly with course suggestions from the context above.
+`.trim();
 
   try {
     const res = await axios.post(
@@ -262,7 +287,7 @@ Include only the fields present in the RAG context.
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt }
         ],
-        max_tokens: 400,
+        max_tokens: 250,
         temperature: 0.4
       },
       {
@@ -281,7 +306,7 @@ Include only the fields present in the RAG context.
 }
 
 /* ============================
-   Main entry (ALL Q&A → RAG → OpenRouter)
+   Main entry (ALL Q&A → RAG → Answer)
 ============================= */
 async function getAIResponse(userId, rawMessage) {
   try {
@@ -370,27 +395,25 @@ async function getAIResponse(userId, rawMessage) {
       return reply;
     }
 
-    // ==== RAG over your dataset (course/provider Qs) ====
- const retrieval = await findRelevantData(messageText);
-const ragContext = buildRAGContext(retrieval);
+    // ==== Dataset-first course suggestion ====
+    const retrieval = await findRelevantData(messageText);
+    if (retrieval && retrieval.length) {
+      const reply = answerFromDataset(retrieval);
+      try { await saveConversation(uid, messageText, reply); } catch (_) {}
+      profile.conversationHistory.push({ message: messageText, response: reply, timestamp: new Date() });
+      if (profile.conversationHistory.length > 20) profile.conversationHistory.shift();
+      if (exists) { try { await updateUserInDB(uid, {}); } catch (_) {} }
+      return reply;
+    }
 
-
-    const aiReply = await generateAIResponse(
-      profile,
-      messageText,
-      profile.conversationHistory.slice(-10),
-      ragContext
-    );
-
-    const cleaned = sanitizeLLMReply(aiReply);
-    const finalReply = cleaned || "I don’t see that in my dataset. Want me to try similar subjects or another provider?";
-
-    try { await saveConversation(uid, messageText, finalReply); } catch (_) {}
-    profile.conversationHistory.push({ message: messageText, response: finalReply, timestamp: new Date() });
+    // ==== Generic fallback (no web) ====
+    const subject = genericSubjectFromMessage(messageText) || 'this subject';
+    const genericReply = answerGeneric(subject);
+    try { await saveConversation(uid, messageText, genericReply); } catch (_) {}
+    profile.conversationHistory.push({ message: messageText, response: genericReply, timestamp: new Date() });
     if (profile.conversationHistory.length > 20) profile.conversationHistory.shift();
     if (exists) { try { await updateUserInDB(uid, {}); } catch (_) {} }
-
-    return finalReply;
+    return genericReply;
 
   } catch (error) {
     console.error('getAIResponse error:', error.message);
