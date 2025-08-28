@@ -6,7 +6,7 @@ const {
   DisconnectReason,
   useMultiFileAuthState
 } = require('@whiskeysockets/baileys');
-const { getAIResponse } = require('./openrouter');
+const { getAIResponse } = require('./ai');
 const { WebSocketServer } = require('ws');
 
 const app = express();
