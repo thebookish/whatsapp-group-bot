@@ -1,12 +1,11 @@
 // rag.js
 const fs = require('fs');
 const zlib = require('zlib');
-const path = require('path');
 const { chain } = require('stream-chain');
 const { parser } = require('stream-json');
 const { streamArray } = require('stream-json/streamers/StreamArray');
-const { pick } = require('stream-json/filters/Pick');
-const { DATA_FILE, DATA_ARRAY_KEY } = require('./config');
+const { streamObject } = require('stream-json/streamers/StreamObject');
+const { DATA_FILE } = require('./config');
 
 /** =========================
  *  Normalization + Helpers
@@ -23,52 +22,80 @@ function tokenize(nb) {
   return nb ? nb.split(' ').filter(t => t && t.length >= 2) : [];
 }
 
-/** Fields to search across (align with your dataset) */
-const TEXT_FIELDS = ['course_title', 'provider_name', 'subject', 'campus', 'mode', 'summary', 'description'];
-/** Fields to keep for building responses (lean footprint) */
-const SLIM_FIELDS = [
-  'course_title', 'provider_name', 'mode', 'duration', 'campus',
-  'start_date', 'ucas', 'ucas_code', 'title', 'provider', 'start'
-];
+// Light stopwords; keep queries focused
+const STOPWORDS = new Set([
+  'suggest','suggestion','suggestions','course','courses','on','in','for','about','of','and','or',
+  'please','plz','a','an','the','me','need','want','looking','search','find','give','recommend',
+  'program','programme','degree'
+]);
+
+// Short aliases → subject terms
+const SUBJECT_ALIASES = {
+  cs: ['computer','science','computer science','computing'],
+  cse: ['computer','science','engineering','computer science'],
+  ai: ['artificial','intelligence','artificial intelligence'],
+  ml: ['machine','learning','machine learning'],
+  ds: ['data','science','data science','analytics'],
+  se: ['software','engineering','software engineering'],
+  it: ['information','technology','information technology','computing'],
+  ee: ['electrical','engineering'],
+  eee: ['electrical','electronic','electrical and electronic'],
+  ece: ['electronics','communication','electronics and communication'],
+  cyber: ['cyber','security','cyber security','cybersecurity'],
+  hci: ['human','computer','interaction','human computer interaction'],
+  fintech: ['financial','technology','financial technology'],
+  'comp sci': ['computer','science','computer science']
+};
+
+function expandQuery(query) {
+  const q = normBase(query);
+  let tokens = q.split(' ').filter(Boolean).filter(t => !STOPWORDS.has(t));
+  const extra = [];
+  for (const t of tokens) {
+    const alias = SUBJECT_ALIASES[t];
+    if (alias) {
+      for (const a of alias) extra.push(...a.split(' ').filter(x => x && x.length >= 2));
+    }
+  }
+  const out = [];
+  const seen = new Set();
+  for (const t of [...tokens, ...extra]) {
+    if (t.length < 2) continue;
+    if (!seen.has(t)) { seen.add(t); out.push(t); }
+  }
+  return out;
+}
 
 /** =========================
- *  Stream a JSON array
+ *  Streaming JSON
  *  =========================
- *  Supports:
- *   - Top-level array: [ {...}, {...} ]
- *   - Object with array at a known key: { "records": [ ... ] }
+ *  Your file is a TOP-LEVEL OBJECT of providers. Each provider has courses[], each course has options[].
+ *  We also retain support for a top-level ARRAY by auto-detecting the first structural token.
  */
-function openJsonArrayStream(filePath, arrayKey) {
+function openJsonStreamFlexible(filePath) {
   const isGzip = filePath.toLowerCase().endsWith('.gz');
   const rs = fs.createReadStream(filePath);
   const pipeline = [];
-
   if (isGzip) pipeline.push(zlib.createGunzip());
-  pipeline.push(parser());
-
-  if (arrayKey && typeof arrayKey === 'string' && arrayKey.trim()) {
-    // Dive into the object key that holds the array
-    pipeline.push(pick({ filter: arrayKey }));
-  }
-  // Now we should be positioned at the array to stream its items
-  pipeline.push(streamArray());
-
+  pipeline.push(parser({ jsonStreaming: true }));
+  // We will detect array vs object when building index and re-pipe accordingly.
   return chain([rs, ...pipeline]);
 }
 
 /** =========================
  *  In-Memory Index
  *  =========================
- *  POSTINGS: Map<string, number[]>         // term -> docIDs
- *  RECORDS: Array<{ idx:number, nb:string, ...slim }>
+ *  POSTINGS: Map<string, number[]>        // term -> sorted list of docIDs
+ *  RECORDS:  Array<{ idx, nb, provider_name, course_title, mode, duration, campus, start_date }>
  */
 let INDEX_READY_PROMISE = null;
 let POSTINGS = null;
 let RECORDS = null;
 
-// Tiny LRU for normalized query → results
+// Small LRU for query -> result caching (by expanded tokens)
 const QUERY_CACHE = new Map();
 const QUERY_CACHE_MAX = 200;
+
 function lruGet(key) {
   if (!QUERY_CACHE.has(key)) return undefined;
   const val = QUERY_CACHE.get(key);
@@ -85,8 +112,57 @@ function lruSet(key, val) {
 }
 
 /**
- * Build the inverted index once by streaming the dataset.
- * Works for top-level arrays or arrays under DATA_ARRAY_KEY.
+ * Flatten one provider object → multiple course-option records.
+ */
+function* flattenProvider(provider) {
+  const pname = provider?.name || '';
+  const pcode = provider?.institutionCode || '';
+  const palias = Array.isArray(provider?.aliases) ? provider.aliases.join(' ') : '';
+  const paddrTown = provider?.address?.line4 || '';
+  const paddrCountry = provider?.address?.country?.mappedCaption || '';
+  const psite = provider?.websiteUrl || '';
+
+  const courses = Array.isArray(provider?.courses) ? provider.courses : [];
+  for (const course of courses) {
+    const ctitle = course?.courseTitle || '';
+    const ccode = course?.applicationCode || '';
+    const cdest = course?.routingData?.destination?.caption || '';
+
+    const options = Array.isArray(course?.options) ? course.options : [];
+    for (const opt of options) {
+      const mode = opt?.studyMode?.mappedCaption || opt?.studyMode?.caption || '';
+      const durationQty = opt?.duration?.quantity;
+      const durationCap = opt?.duration?.durationType?.caption;
+      const duration = (durationQty && durationCap) ? `${durationQty} ${durationCap}` : '';
+      const campus = opt?.location?.name || '';
+      const start_date = opt?.startDate?.date || '';
+      const outcome = opt?.outcomeQualification?.caption || '';
+
+      // Build normalized blob for indexing
+      const nbParts = [
+        pname, pcode, palias, paddrTown, paddrCountry, psite,
+        ctitle, ccode, cdest,
+        mode, duration, campus, start_date, outcome
+      ];
+      const nb = normBase(nbParts.filter(Boolean).join(' '));
+      if (!nb) continue;
+
+      yield {
+        provider_name: pname,
+        course_title: ctitle,
+        mode,
+        duration,
+        campus,
+        start_date,
+        nb
+      };
+    }
+  }
+}
+
+/**
+ * Build the index exactly once by streaming the dataset.
+ * Auto-detects top-level OBJECT vs ARRAY and streams accordingly.
  */
 async function buildIndex() {
   if (INDEX_READY_PROMISE) return INDEX_READY_PROMISE;
@@ -95,82 +171,146 @@ async function buildIndex() {
     POSTINGS = new Map();
     RECORDS = [];
 
-    const stream = openJsonArrayStream(DATA_FILE, DATA_ARRAY_KEY);
-    let idx = 0;
-
+    // First pass: detect whether top-level is array or object
+    const peek = openJsonStreamFlexible(DATA_FILE);
+    let topType = null; // 'array' | 'object'
     await new Promise((resolve, reject) => {
-      stream.on('data', ({ value }) => {
-        try {
-          const blob = TEXT_FIELDS.map(k => value?.[k] ?? '').join(' ');
-          const nb = normBase(blob);
-          if (!nb) { idx++; return; }
-
-          const slim = {};
-          for (const f of SLIM_FIELDS) if (value?.[f] != null) slim[f] = value[f];
-          slim.idx = idx;
-          slim.nb = nb;
-
-          RECORDS.push(slim);
-
-          const terms = new Set(tokenize(nb));
-          for (const t of terms) {
-            let list = POSTINGS.get(t);
-            if (!list) { list = []; POSTINGS.set(t, list); }
-            list.push(idx);
-          }
-          idx++;
-        } catch {
-          idx++; // skip malformed row, keep index advancing
-        }
+      peek.once('data', (token) => {
+        // token.value contains tokens; easier: inspect token.name
+        // But parser emits a stream of tokens; we need to determine the first start token
+        // We'll look for the first token with "name" startArray or startObject
+        if (token?.name === 'startArray') topType = 'array';
+        else if (token?.name === 'startObject') topType = 'object';
+        resolve();
       });
-
-      stream.on('end', resolve);
-      stream.on('error', (err) => {
-        // Helpful hint when top-level isn't an array and no key provided
-        if (!DATA_ARRAY_KEY) {
-          reject(new Error(
-            `Failed to stream JSON array. If your file is an object like { "records": [...] }, set DATA_ARRAY_KEY="records". Original: ${err.message}`
-          ));
-        } else {
-          reject(err);
-        }
-      });
+      peek.once('error', reject);
+      // If the file is small, add fallback timeout
+      setTimeout(() => resolve(), 50);
     });
+
+    // Now build a proper stream pipeline for the detected structure
+    const isGzip = DATA_FILE.toLowerCase().endsWith('.gz');
+    const rs = fs.createReadStream(DATA_FILE);
+    const pipeline = [];
+    if (isGzip) pipeline.push(zlib.createGunzip());
+    pipeline.push(parser());
+
+    if (topType === 'array') {
+      pipeline.push(streamArray());
+      const stream = chain([rs, ...pipeline]);
+      let idx = 0;
+      await new Promise((resolve, reject) => {
+        stream.on('data', ({ value }) => {
+          try {
+            // If array items are providers (unlikely for your file), support both cases:
+            // 1) provider object with courses[]
+            // 2) already flattened course record
+            if (value && value.courses) {
+              for (const rec of flattenProvider(value)) {
+                const withIdx = { ...rec, idx };
+                RECORDS.push(withIdx);
+                indexRecord(withIdx);
+                idx++;
+              }
+            } else {
+              // If it’s already a flat record (provider_name, course_title, etc.)
+              const nb = normBase(Object.values(value || {}).join(' '));
+              if (!nb) return;
+              const withIdx = { ...value, nb, idx };
+              RECORDS.push(withIdx);
+              indexRecord(withIdx);
+              idx++;
+            }
+          } catch {
+            idx++;
+          }
+        });
+        stream.on('end', resolve);
+        stream.on('error', reject);
+      });
+    } else {
+      // Default: top-level OBJECT of providers (your case)
+      const { streamObject } = require('stream-json/streamers/StreamObject');
+      pipeline.push(streamObject());
+      const stream = chain([rs, ...pipeline]);
+      let idx = 0;
+      await new Promise((resolve, reject) => {
+        stream.on('data', ({ key, value }) => {
+          try {
+            // key is provider id; value is the provider object
+            for (const rec of flattenProvider(value)) {
+              const withIdx = { ...rec, idx };
+              RECORDS.push(withIdx);
+              indexRecord(withIdx);
+              idx++;
+            }
+          } catch {
+            idx++;
+          }
+        });
+        stream.on('end', resolve);
+        stream.on('error', reject);
+      });
+    }
   })();
 
   return INDEX_READY_PROMISE;
 }
 
+function indexRecord(rec) {
+  // Tokenize doc text; add synonym triggers if phrases present
+  const terms = new Set(tokenize(rec.nb));
+
+  // Phrase-based short tags → postings enrichment
+  if (rec.nb.includes('computer science')) terms.add('cs');
+  if (rec.nb.includes('artificial intelligence')) terms.add('ai');
+  if (rec.nb.includes('data science')) terms.add('ds');
+  if (rec.nb.includes('software engineering')) terms.add('se');
+  if (rec.nb.includes('information technology')) terms.add('it');
+  if (rec.nb.includes('machine learning')) terms.add('ml');
+  if (rec.nb.includes('electrical and electronic')) terms.add('eee');
+  if (rec.nb.includes('electrical engineering')) terms.add('ee');
+  if (rec.nb.includes('electronics and communication')) terms.add('ece');
+  if (rec.nb.includes('cyber security') || rec.nb.includes('cybersecurity')) terms.add('cyber');
+
+  for (const t of terms) {
+    let list = POSTINGS.get(t);
+    if (!list) { list = []; POSTINGS.set(t, list); }
+    list.push(rec.idx);
+  }
+}
+
+/** =========================
+ *  Query using the index
+ *  ========================= */
 function scoreDocByHits(doc, terms) {
   let score = 0;
   const nb = doc.nb;
   for (const t of terms) {
     if (t.length < 2) continue;
-    const hits = nb.split(t).length - 1; // fast substring count
+    const hits = nb.split(t).length - 1;
     score += hits;
   }
   return score;
 }
 
 /**
- * Indexed retrieval (no full file rescans on each query).
+ * Indexed retrieval: uses POSTINGS to get candidates, then cheap scoring.
+ * Returns slim records (without nb) limited to {max}.
  */
 async function findRelevantData(query, opts = {}) {
   const { max = 20 } = opts;
-  const q = normBase(query);
-  if (!q) return [];
-
   await buildIndex();
 
-  const cached = lruGet(q);
+  const expandedTokens = expandQuery(query);
+  if (!expandedTokens.length) return [];
+
+  const cacheKey = expandedTokens.join(' ');
+  const cached = lruGet(cacheKey);
   if (cached) return cached.slice(0, max);
 
-  const terms = tokenize(q);
-  if (!terms.length) return [];
-
-  // Collect candidate doc IDs from postings (union)
   const candidateCounts = new Map();
-  for (const t of terms) {
+  for (const t of expandedTokens) {
     const posting = POSTINGS.get(t);
     if (!posting) continue;
     for (let i = 0; i < posting.length; i++) {
@@ -180,27 +320,26 @@ async function findRelevantData(query, opts = {}) {
   }
   if (candidateCounts.size === 0) return [];
 
-  // Materialize candidates and score
   const candidates = [];
   for (const docId of candidateCounts.keys()) {
     const doc = RECORDS[docId];
     if (doc) candidates.push(doc);
   }
 
-  const scored = candidates.map(doc => ({ score: scoreDocByHits(doc, terms), doc }));
+  const scored = candidates.map(doc => ({ score: scoreDocByHits(doc, expandedTokens), doc }));
   scored.sort((a, b) => b.score - a.score);
 
   const top = scored.slice(0, max).map(({ doc }) => {
-    const { nb, ...rest } = doc; // strip search blob
+    const { nb, ...rest } = doc;
     return rest;
   });
 
-  lruSet(q, top);
+  lruSet(cacheKey, top);
   return top;
 }
 
 /** =========================
- *  Context Builder & Cleaner
+ *  (Optional) Context builder & cleaner
  *  ========================= */
 function buildRAGContext(records = []) {
   const lines = records.map((r, i) => {
@@ -210,14 +349,12 @@ function buildRAGContext(records = []) {
     const duration = r.duration || '';
     const campus = r.campus || '';
     const start = r.start_date || r.start || '';
-    const ucas = r.ucas || r.ucas_code || '';
     return [
       `#${i + 1} ${title}${provider ? ` – ${provider}` : ''}`,
       mode ? `Mode: ${mode}` : null,
       duration ? `Duration: ${duration}` : null,
       campus ? `Campus: ${campus}` : null,
       start ? `Start: ${start}` : null,
-      ucas ? `UCAS: ${ucas}` : null,
     ].filter(Boolean).join(' | ');
   });
   return lines.join('\n');
