@@ -1,6 +1,7 @@
 // rag.js
 const fs = require('fs');
 const zlib = require('zlib');
+const path = require('path');
 const { chain } = require('stream-chain');
 const { parser } = require('stream-json');
 const { streamArray } = require('stream-json/streamers/StreamArray');
@@ -19,66 +20,61 @@ function normBase(s) {
     .trim();
 }
 function tokenize(nb) {
-  return nb ? nb.split(' ').filter(t => t && t.length >= 2) : [];
+  if (!nb) return [];
+  return nb.split(' ').filter(t => t && t.length >= 2);
 }
-
-// Light stopwords; keep queries focused
-const STOPWORDS = new Set([
-  'suggest','suggestion','suggestions','course','courses','on','in','for','about','of','and','or',
-  'please','plz','a','an','the','me','need','want','looking','search','find','give','recommend',
-  'program','programme','degree'
-]);
-
-// Short aliases → subject terms
-const SUBJECT_ALIASES = {
-  cs: ['computer','science','computer science','computing'],
-  cse: ['computer','science','engineering','computer science'],
-  ai: ['artificial','intelligence','artificial intelligence'],
-  ml: ['machine','learning','machine learning'],
-  ds: ['data','science','data science','analytics'],
-  se: ['software','engineering','software engineering'],
-  it: ['information','technology','information technology','computing'],
-  ee: ['electrical','engineering'],
-  eee: ['electrical','electronic','electrical and electronic'],
-  ece: ['electronics','communication','electronics and communication'],
-  cyber: ['cyber','security','cyber security','cybersecurity'],
-  hci: ['human','computer','interaction','human computer interaction'],
-  fintech: ['financial','technology','financial technology'],
-  'comp sci': ['computer','science','computer science']
-};
-
-function expandQuery(query) {
-  const q = normBase(query);
-  let tokens = q.split(' ').filter(Boolean).filter(t => !STOPWORDS.has(t));
-  const extra = [];
-  for (const t of tokens) {
-    const alias = SUBJECT_ALIASES[t];
-    if (alias) {
-      for (const a of alias) extra.push(...a.split(' ').filter(x => x && x.length >= 2));
+function isNumber(v) {
+  return typeof v === 'number' && Number.isFinite(v);
+}
+function tryParseNumber(v) {
+  if (isNumber(v)) return v;
+  if (typeof v === 'string') {
+    const m = v.replace(/[,£$]/g, '').match(/-?\d+(\.\d+)?/);
+    if (m) return Number(m[0]);
+  }
+  return NaN;
+}
+function firstNonWsChar(filePath) {
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const buf = Buffer.alloc(1024);
+    const read = fs.readSync(fd, buf, 0, 1024, 0);
+    const s = buf.slice(0, read).toString('utf8');
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (!/\s/.test(c)) return c;
     }
+    return null;
+  } finally {
+    fs.closeSync(fd);
   }
-  const out = [];
-  const seen = new Set();
-  for (const t of [...tokens, ...extra]) {
-    if (t.length < 2) continue;
-    if (!seen.has(t)) { seen.add(t); out.push(t); }
-  }
-  return out;
+}
+function monthTokenFromDate(dmy) {
+  // expects "DD/MM/YYYY" like "15/09/2025"
+  if (!dmy || typeof dmy !== 'string') return '';
+  const m = dmy.split('/')[1];
+  if (!m) return '';
+  const n = Number(m);
+  const names = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
+  return names[(n - 1) | 0] || '';
 }
 
 /** =========================
- *  Streaming JSON
- *  =========================
- *  Your file is a TOP-LEVEL OBJECT of providers. Each provider has courses[], each course has options[].
- *  We also retain support for a top-level ARRAY by auto-detecting the first structural token.
- */
-function openJsonStreamFlexible(filePath) {
-  const isGzip = filePath.toLowerCase().endsWith('.gz');
+ *  Streaming JSON (array or object root)
+ *  ========================= */
+function openRootStream(filePath) {
+  const isGzip = filePath.endsWith('.gz');
+  const first = isGzip ? '[' : firstNonWsChar(filePath); // if gz, we can’t peek easily; assume array/object not known → parser+object streamer works either way when chained correctly
+
   const rs = fs.createReadStream(filePath);
   const pipeline = [];
   if (isGzip) pipeline.push(zlib.createGunzip());
-  pipeline.push(parser({ jsonStreaming: true }));
-  // We will detect array vs object when building index and re-pipe accordingly.
+  pipeline.push(parser());
+
+  // If root is an array: use streamArray; if '{': use streamObject; if unknown, default to object.
+  const rootIsArray = first === '[';
+  pipeline.push(rootIsArray ? streamArray() : streamObject());
+
   return chain([rs, ...pipeline]);
 }
 
@@ -86,21 +82,18 @@ function openJsonStreamFlexible(filePath) {
  *  In-Memory Index
  *  =========================
  *  POSTINGS: Map<string, number[]>        // term -> sorted list of docIDs
- *  RECORDS:  Array<{ idx, nb, provider_name, course_title, mode, duration, campus, start_date }>
+ *  RECORDS: Array<{ idx:number, nb:string, ...slim, raw:any }>
  */
 let INDEX_READY_PROMISE = null;
 let POSTINGS = null;
 let RECORDS = null;
 
-// Small LRU for query -> result caching (by expanded tokens)
 const QUERY_CACHE = new Map();
 const QUERY_CACHE_MAX = 200;
-
 function lruGet(key) {
   if (!QUERY_CACHE.has(key)) return undefined;
   const val = QUERY_CACHE.get(key);
-  QUERY_CACHE.delete(key);
-  QUERY_CACHE.set(key, val);
+  QUERY_CACHE.delete(key); QUERY_CACHE.set(key, val);
   return val;
 }
 function lruSet(key, val) {
@@ -111,181 +104,128 @@ function lruSet(key, val) {
   }
 }
 
-/**
- * Flatten one provider object → multiple course-option records.
- */
-function* flattenProvider(provider) {
-  const pname = provider?.name || '';
-  const pcode = provider?.institutionCode || '';
-  const palias = Array.isArray(provider?.aliases) ? provider.aliases.join(' ') : '';
-  const paddrTown = provider?.address?.line4 || '';
-  const paddrCountry = provider?.address?.country?.mappedCaption || '';
-  const psite = provider?.websiteUrl || '';
+/** Flatten provider → course → option into a single record */
+function makeRecord(provider, course, option, idx) {
+  const provider_name = provider?.name || provider?.aliasName || '';
+  const provider_city = provider?.address?.line4 || '';
+  const provider_country = provider?.address?.country?.mappedCaption || '';
+  const course_title = course?.courseTitle || '';
+  const academic_year = course?.academicYearId || '';
+  const destination = course?.routingData?.destination?.caption || '';
+  const application_code = course?.applicationCode || '';
+  const study_mode = option?.studyMode?.mappedCaption || option?.studyMode?.caption || '';
+  const duration_qty = option?.duration?.quantity ?? null;
+  const duration_unit = option?.duration?.durationType?.caption || '';
+  const campus = option?.location?.name || '';
+  const start_date_raw = option?.startDate?.date || '';
+  const start_month = monthTokenFromDate(start_date_raw); // e.g., 'sep'
+  const qualification = option?.outcomeQualification?.caption || '';
 
-  const courses = Array.isArray(provider?.courses) ? provider.courses : [];
-  for (const course of courses) {
-    const ctitle = course?.courseTitle || '';
-    const ccode = course?.applicationCode || '';
-    const cdest = course?.routingData?.destination?.caption || '';
+  // Build a text blob for indexing/search
+  const textBlob = [
+    provider_name, provider_city, provider_country,
+    course_title, academic_year, destination, application_code,
+    study_mode, duration_unit, campus, start_date_raw, start_month, qualification,
+    provider?.aboutUs, provider?.whatMakesUsDifferent,
+    ...(Array.isArray(provider?.aliases) ? provider.aliases : [])
+  ].filter(Boolean).join(' ');
 
-    const options = Array.isArray(course?.options) ? course.options : [];
-    for (const opt of options) {
-      const mode = opt?.studyMode?.mappedCaption || opt?.studyMode?.caption || '';
-      const durationQty = opt?.duration?.quantity;
-      const durationCap = opt?.duration?.durationType?.caption;
-      const duration = (durationQty && durationCap) ? `${durationQty} ${durationCap}` : '';
-      const campus = opt?.location?.name || '';
-      const start_date = opt?.startDate?.date || '';
-      const outcome = opt?.outcomeQualification?.caption || '';
+  const nb = normBase(textBlob);
 
-      // Build normalized blob for indexing
-      const nbParts = [
-        pname, pcode, palias, paddrTown, paddrCountry, psite,
-        ctitle, ccode, cdest,
-        mode, duration, campus, start_date, outcome
-      ];
-      const nb = normBase(nbParts.filter(Boolean).join(' '));
-      if (!nb) continue;
+  const slim = {
+    idx,
+    nb,
+    provider_name,
+    course_title,
+    campus,
+    mode: study_mode,
+    start_date: start_date_raw,
+    start_month,
+    duration: duration_qty != null && duration_unit ? `${duration_qty} ${duration_unit}` : (duration_qty ?? ''),
+    qualification,
+    academic_year,
+    application_code,
+  };
 
-      yield {
-        provider_name: pname,
-        course_title: ctitle,
-        mode,
-        duration,
-        campus,
-        start_date,
-        nb
-      };
-    }
-  }
+  const raw = {
+    provider,
+    course,
+    option,
+    // convenient denormalized fields too:
+    provider_name,
+    provider_city,
+    provider_country,
+    course_title,
+    academic_year,
+    destination,
+    application_code,
+    study_mode,
+    duration_qty,
+    duration_unit,
+    campus,
+    start_date_raw,
+    start_month,
+    qualification,
+  };
+
+  return { ...slim, raw };
 }
 
-/**
- * Build the index exactly once by streaming the dataset.
- * Auto-detects top-level OBJECT vs ARRAY and streams accordingly.
- */
+/** Build the index once */
 async function buildIndex() {
   if (INDEX_READY_PROMISE) return INDEX_READY_PROMISE;
-
   INDEX_READY_PROMISE = (async () => {
     POSTINGS = new Map();
     RECORDS = [];
 
-    // First pass: detect whether top-level is array or object
-    const peek = openJsonStreamFlexible(DATA_FILE);
-    let topType = null; // 'array' | 'object'
+    const stream = openRootStream(DATA_FILE);
+    let idx = 0;
+
     await new Promise((resolve, reject) => {
-      peek.once('data', (token) => {
-        // token.value contains tokens; easier: inspect token.name
-        // But parser emits a stream of tokens; we need to determine the first start token
-        // We'll look for the first token with "name" startArray or startObject
-        if (token?.name === 'startArray') topType = 'array';
-        else if (token?.name === 'startObject') topType = 'object';
-        resolve();
-      });
-      peek.once('error', reject);
-      // If the file is small, add fallback timeout
-      setTimeout(() => resolve(), 50);
-    });
+      stream.on('data', ({ value }) => {
+        try {
+          // When streaming an object with streamObject, "value" is the provider object.
+          // When streaming an array with streamArray, "value" is the entry itself.
+          const provider = value;
 
-    // Now build a proper stream pipeline for the detected structure
-    const isGzip = DATA_FILE.toLowerCase().endsWith('.gz');
-    const rs = fs.createReadStream(DATA_FILE);
-    const pipeline = [];
-    if (isGzip) pipeline.push(zlib.createGunzip());
-    pipeline.push(parser());
+          if (!provider || typeof provider !== 'object') return;
 
-    if (topType === 'array') {
-      pipeline.push(streamArray());
-      const stream = chain([rs, ...pipeline]);
-      let idx = 0;
-      await new Promise((resolve, reject) => {
-        stream.on('data', ({ value }) => {
-          try {
-            // If array items are providers (unlikely for your file), support both cases:
-            // 1) provider object with courses[]
-            // 2) already flattened course record
-            if (value && value.courses) {
-              for (const rec of flattenProvider(value)) {
-                const withIdx = { ...rec, idx };
-                RECORDS.push(withIdx);
-                indexRecord(withIdx);
-                idx++;
+          const courses = Array.isArray(provider.courses) ? provider.courses : [];
+          for (const course of courses) {
+            const options = Array.isArray(course.options) ? course.options : [null];
+            for (const option of options) {
+              const rec = makeRecord(provider, course, option, idx);
+              if (!rec.nb) { idx++; continue; }
+
+              // store
+              RECORDS.push(rec);
+
+              // index postings (unique terms per doc)
+              const terms = new Set(tokenize(rec.nb));
+              for (const t of terms) {
+                let list = POSTINGS.get(t);
+                if (!list) { list = []; POSTINGS.set(t, list); }
+                list.push(idx);
               }
-            } else {
-              // If it’s already a flat record (provider_name, course_title, etc.)
-              const nb = normBase(Object.values(value || {}).join(' '));
-              if (!nb) return;
-              const withIdx = { ...value, nb, idx };
-              RECORDS.push(withIdx);
-              indexRecord(withIdx);
               idx++;
             }
-          } catch {
-            idx++;
           }
-        });
-        stream.on('end', resolve);
-        stream.on('error', reject);
+        } catch {
+          // ignore malformed provider entry, continue
+        }
       });
-    } else {
-      // Default: top-level OBJECT of providers (your case)
-      const { streamObject } = require('stream-json/streamers/StreamObject');
-      pipeline.push(streamObject());
-      const stream = chain([rs, ...pipeline]);
-      let idx = 0;
-      await new Promise((resolve, reject) => {
-        stream.on('data', ({ key, value }) => {
-          try {
-            // key is provider id; value is the provider object
-            for (const rec of flattenProvider(value)) {
-              const withIdx = { ...rec, idx };
-              RECORDS.push(withIdx);
-              indexRecord(withIdx);
-              idx++;
-            }
-          } catch {
-            idx++;
-          }
-        });
-        stream.on('end', resolve);
-        stream.on('error', reject);
-      });
-    }
+      stream.on('end', resolve);
+      stream.on('error', reject);
+    });
   })();
 
   return INDEX_READY_PROMISE;
 }
 
-function indexRecord(rec) {
-  // Tokenize doc text; add synonym triggers if phrases present
-  const terms = new Set(tokenize(rec.nb));
-
-  // Phrase-based short tags → postings enrichment
-  if (rec.nb.includes('computer science')) terms.add('cs');
-  if (rec.nb.includes('artificial intelligence')) terms.add('ai');
-  if (rec.nb.includes('data science')) terms.add('ds');
-  if (rec.nb.includes('software engineering')) terms.add('se');
-  if (rec.nb.includes('information technology')) terms.add('it');
-  if (rec.nb.includes('machine learning')) terms.add('ml');
-  if (rec.nb.includes('electrical and electronic')) terms.add('eee');
-  if (rec.nb.includes('electrical engineering')) terms.add('ee');
-  if (rec.nb.includes('electronics and communication')) terms.add('ece');
-  if (rec.nb.includes('cyber security') || rec.nb.includes('cybersecurity')) terms.add('cyber');
-
-  for (const t of terms) {
-    let list = POSTINGS.get(t);
-    if (!list) { list = []; POSTINGS.set(t, list); }
-    list.push(rec.idx);
-  }
-}
-
-/** =========================
- *  Query using the index
- *  ========================= */
+/** Scoring */
 function scoreDocByHits(doc, terms) {
   let score = 0;
-  const nb = doc.nb;
+  const nb = doc.nb || '';
   for (const t of terms) {
     if (t.length < 2) continue;
     const hits = nb.split(t).length - 1;
@@ -294,23 +234,22 @@ function scoreDocByHits(doc, terms) {
   return score;
 }
 
-/**
- * Indexed retrieval: uses POSTINGS to get candidates, then cheap scoring.
- * Returns slim records (without nb) limited to {max}.
- */
+/** Retrieve top records */
 async function findRelevantData(query, opts = {}) {
-  const { max = 20 } = opts;
+  const { max = 100 } = opts;
+  const q = normBase(query);
+  if (!q) return [];
+
   await buildIndex();
 
-  const expandedTokens = expandQuery(query);
-  if (!expandedTokens.length) return [];
-
-  const cacheKey = expandedTokens.join(' ');
-  const cached = lruGet(cacheKey);
+  const cached = lruGet(q);
   if (cached) return cached.slice(0, max);
 
+  const terms = tokenize(q);
+  if (!terms.length) return [];
+
   const candidateCounts = new Map();
-  for (const t of expandedTokens) {
+  for (const t of terms) {
     const posting = POSTINGS.get(t);
     if (!posting) continue;
     for (let i = 0; i < posting.length; i++) {
@@ -326,47 +265,218 @@ async function findRelevantData(query, opts = {}) {
     if (doc) candidates.push(doc);
   }
 
-  const scored = candidates.map(doc => ({ score: scoreDocByHits(doc, expandedTokens), doc }));
+  const scored = candidates.map(doc => ({ score: scoreDocByHits(doc, terms), doc }));
   scored.sort((a, b) => b.score - a.score);
+  const top = scored.slice(0, max).map(({ doc }) => doc);
 
-  const top = scored.slice(0, max).map(({ doc }) => {
-    const { nb, ...rest } = doc;
-    return rest;
-  });
-
-  lruSet(cacheKey, top);
+  lruSet(q, top);
   return top;
 }
 
 /** =========================
- *  (Optional) Context builder & cleaner
+ *  Lightweight analytics
  *  ========================= */
+const NUMERIC_FIELD_CANDIDATES = [
+  'tuition_fee','tuition','fee','fees','international_fee','home_fee',
+  'price','cost','duration_qty','duration_months','duration_weeks','duration_years','duration'
+];
+
+function pickNumericField(rows, questionLower) {
+  // hint via question
+  const hintPairs = [
+    [/tuition|fee|fees|cost|price/, ['international_fee','tuition_fee','home_fee','tuition','fees','price','cost']],
+    [/duration|length|years|months|weeks/, ['duration_qty','duration_months','duration_weeks','duration_years','duration']]
+  ];
+  for (const [re, prefs] of hintPairs) {
+    if (re.test(questionLower)) {
+      const f = prefs.find(k => rows.some(r => !Number.isNaN(tryParseNumber(r.raw?.[k]))));
+      if (f) return f;
+    }
+  }
+  // else first available
+  return NUMERIC_FIELD_CANDIDATES.find(k => rows.some(r => !Number.isNaN(tryParseNumber(r.raw?.[k]))));
+}
+
+function detectIntent(q) {
+  const s = q.toLowerCase();
+  if (/\b(how many|count|number of)\b/.test(s)) return 'COUNT';
+  if (/\b(average|avg|mean)\b/.test(s)) return 'AVG';
+  if (/\b(min|minimum|cheapest|lowest|least)\b/.test(s)) return 'MIN';
+  if (/\b(max|maximum|most expensive|highest|largest)\b/.test(s)) return 'MAX';
+  return 'LIST';
+}
+
+function buildFilters(q) {
+  const s = q.toLowerCase();
+  const filters = [];
+
+  // keyword tail: "... in/for/on X"
+  const tail = s.match(/\b(?:in|on|for)\s+([a-z0-9 \-&\/]{3,})$/i);
+  if (tail && tail[1]) {
+    const subj = tail[1].trim();
+    filters.push(rec => {
+      const hay = [
+        rec.raw?.course_title, rec.raw?.destination, rec.raw?.qualification,
+        rec.raw?.provider_name, rec.raw?.provider_city, rec.raw?.provider_country,
+        rec.raw?.campus
+      ].map(x => (x || '').toString().toLowerCase()).join(' | ');
+      return hay.includes(subj);
+    });
+  }
+
+  // common UK cities; feel free to expand
+  const locationWords = ['london','manchester','birmingham','leeds','sheffield','edinburgh','glasgow','oxford','cambridge','bristol','cardiff','liverpool','nottingham','newcastle','bath','brighton','coventry','york','aberdeen','hornchurch','havering','redbridge','hackney','rainham'];
+  for (const w of locationWords) {
+    if (s.includes(w)) {
+      filters.push(rec => {
+        const hay = [
+          rec.raw?.provider_city, rec.raw?.campus, rec.raw?.provider_name
+        ].map(x => (x || '').toString().toLowerCase()).join(' | ');
+        return hay.includes(w);
+      });
+    }
+  }
+
+  // mode
+  if (/\bonline|distance|remote\b/.test(s)) {
+    filters.push(rec => /online|distance|remote/.test((rec.raw?.study_mode || '').toString().toLowerCase()));
+  }
+  if (/\bfull[- ]?time|on[- ]?campus|in person\b/.test(s)) {
+    filters.push(rec => /full.?time|on.?campus|in.?person/.test((rec.raw?.study_mode || '').toString().toLowerCase()));
+  }
+  if (/\bpart[- ]?time\b/.test(s)) {
+    filters.push(rec => /part.?time/.test((rec.raw?.study_mode || '').toString().toLowerCase()));
+  }
+
+  // start month word
+  const month = (s.match(/\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/) || [])[0];
+  if (month) {
+    const m3 = month.slice(0,3).toLowerCase();
+    filters.push(rec => (rec.raw?.start_month || '').toLowerCase().startsWith(m3));
+  }
+
+  // level keywords
+  if (/\bpostgraduate|pg|pgce\b/.test(s)) {
+    filters.push(rec => /(postgraduate|pgce)/.test((rec.raw?.destination || rec.raw?.qualification || '').toString().toLowerCase()));
+  }
+  if (/\bundergraduate|ug|bachelor|ba|bsc|hnd|hnc\b/.test(s)) {
+    filters.push(rec => /(undergraduate|bachelor|ba|bsc|hnd|hnc)/.test((rec.raw?.destination || rec.raw?.qualification || '').toString().toLowerCase()));
+  }
+
+  return filters;
+}
+
+function applyFilters(rows, filters) {
+  if (!filters.length) return rows;
+  return rows.filter(r => filters.every(fn => fn(r)));
+}
+
+function summarizeRows(rows, limit = 10) {
+  const lines = [];
+  for (const r of rows.slice(0, limit)) {
+    const uni = r.raw?.provider_name || '';
+    const title = r.raw?.course_title || '';
+    const start = r.raw?.start_date_raw || '';
+    const mode = r.raw?.study_mode || '';
+    const campus = r.raw?.campus || '';
+    const qual = r.raw?.qualification || '';
+    lines.push(
+      [uni && title ? `${uni} — ${title}` : (title || uni || 'Course'),
+       qual ? `(${qual})` : null,
+       start ? `Start: ${start}` : null,
+       mode ? `Mode: ${mode}` : null,
+       campus ? `Campus: ${campus}` : null
+      ].filter(Boolean).join(' | ')
+    );
+  }
+  return lines.join('\n');
+}
+
+/** Main high-level query over dataset */
+async function queryDataset(question, opts = {}) {
+  const retrieved = await findRelevantData(question, { max: opts.max || 200 });
+  if (!retrieved.length) return { intent: 'LIST', count: 0, rows: [], text: 'Not found in dataset.' };
+
+  const filters = buildFilters(question);
+  const filtered = applyFilters(retrieved, filters);
+
+  const intent = detectIntent(question);
+  if (intent === 'COUNT') {
+    return { intent, count: filtered.length, rows: filtered, text: `Found ${filtered.length}.` };
+  }
+
+  if (intent === 'AVG' || intent === 'MIN' || intent === 'MAX') {
+    const field = pickNumericField(filtered, question.toLowerCase());
+    if (!field) {
+      return { intent: 'LIST', rows: filtered, text: summarizeRows(filtered) };
+    }
+    const nums = filtered
+      .map(r => ({ rec: r, val: tryParseNumber(r.raw?.[field]) }))
+      .filter(x => !Number.isNaN(x.val));
+
+    if (!nums.length) {
+      return { intent: 'LIST', rows: filtered, text: summarizeRows(filtered) };
+    }
+
+    if (intent === 'AVG') {
+      const avg = nums.reduce((a,b)=>a+b.val,0) / nums.length;
+      return { intent, fieldUsed: field, value: Math.round(avg), rows: filtered, text: `Average ${field.replace(/_/g,' ')} ≈ ${Math.round(avg)}.` };
+    }
+    if (intent === 'MIN') {
+      let best = nums[0];
+      for (const n of nums) if (n.val < best.val) best = n;
+      return {
+        intent, fieldUsed: field, value: best.val, rows: filtered,
+        text: `Lowest ${field.replace(/_/g,' ')}: ${best.val} — ${best.rec.raw?.provider_name || ''} — ${best.rec.raw?.course_title || ''}`
+      };
+    }
+    if (intent === 'MAX') {
+      let best = nums[0];
+      for (const n of nums) if (n.val > best.val) best = n;
+      return {
+        intent, fieldUsed: field, value: best.val, rows: filtered,
+        text: `Highest ${field.replace(/_/g,' ')}: ${best.val} — ${best.rec.raw?.provider_name || ''} — ${best.rec.raw?.course_title || ''}`
+      };
+    }
+  }
+
+  return { intent: 'LIST', rows: filtered, text: summarizeRows(filtered) };
+}
+
+/** Existing helpers for LLM context builds (still useful) */
 function buildRAGContext(records = []) {
   const lines = records.map((r, i) => {
-    const title = r.course_title || r.title || 'Course';
-    const provider = r.provider_name || r.provider || '';
-    const mode = r.mode || '';
-    const duration = r.duration || '';
-    const campus = r.campus || '';
-    const start = r.start_date || r.start || '';
+    const title = r.course_title || r.raw?.course_title || r.raw?.course?.courseTitle || 'Course';
+    const provider = r.provider_name || r.raw?.provider_name || '';
+    const mode = r.mode || r.raw?.study_mode || '';
+    const duration = r.duration || (r.raw?.duration_qty != null ? `${r.raw.duration_qty} ${r.raw.duration_unit||''}`.trim() : '');
+    const campus = r.campus || r.raw?.campus || '';
+    const start = r.start_date || r.raw?.start_date_raw || '';
+    const qual = r.raw?.qualification || '';
+    const app = r.application_code || r.raw?.application_code || '';
     return [
       `#${i + 1} ${title}${provider ? ` – ${provider}` : ''}`,
+      qual ? `Qualification: ${qual}` : null,
       mode ? `Mode: ${mode}` : null,
       duration ? `Duration: ${duration}` : null,
       campus ? `Campus: ${campus}` : null,
       start ? `Start: ${start}` : null,
+      app ? `Application: ${app}` : null,
     ].filter(Boolean).join(' | ');
   });
   return lines.join('\n');
 }
-
 function sanitizeLLMReply(s) {
   if (!s || typeof s !== 'string') return '';
   return s.replace(/\s+$/g, '').trim();
 }
 
 module.exports = {
+  // search & analytics
   findRelevantData,
+  queryDataset,
+
+  // utils
   buildRAGContext,
   sanitizeLLMReply,
   normBase
