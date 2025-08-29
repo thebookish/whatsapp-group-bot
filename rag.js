@@ -147,43 +147,23 @@ function lruSet(key, val) {
      application_code,
    };
 
--  const raw = {
--    provider,
--    course,
--    option,
--    // convenient denormalized fields too:
--    provider_name,
--    provider_city,
--    provider_country,
--    course_title,
--    academic_year,
--    destination,
--    application_code,
--    study_mode,
--    duration_qty,
--    duration_unit,
--    campus,
--    start_date_raw,
--    start_month,
--    qualification,
--  };
-+  // Keep ONLY the small denormalized fields you actually use elsewhere.
-+  const raw = {
-+    provider_name,
-+    provider_city,
-+    provider_country,
-+    course_title,
-+    academic_year,
-+    destination,
-+    application_code,
-+    study_mode,
-+    duration_qty,
-+    duration_unit,
-+    campus,
-+    start_date_raw,
-+    start_month,
-+    qualification,
-+  };
+  // Keep ONLY the small denormalized fields you actually use elsewhere.
+  const raw = {
+    provider_name,
+    provider_city,
+    provider_country,
+    course_title,
+    academic_year,
+    destination,
+    application_code,
+    study_mode,
+    duration_qty,
+    duration_unit,
+    campus,
+    start_date_raw,
+    start_month,
+    qualification,
+  };
 
    return { ...slim, raw };
  }
