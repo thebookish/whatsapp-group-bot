@@ -81,9 +81,10 @@ function openRootStream(filePath) {
  *  =========================
  */
 let INDEX_READY_PROMISE = null;
-let POSTINGS = null;
-let RECORDS = null;
+let POSTINGS = null;   // Map<string, number[]>
+let RECORDS = null;    // Array<rec>
 
+/** Small LRU for query results */
 const QUERY_CACHE = new Map();
 const QUERY_CACHE_MAX = 200;
 function lruGet(key) {
@@ -100,7 +101,9 @@ function lruSet(key, val) {
   }
 }
 
-/** Flatten provider → course → option into a single record */
+/** =========================
+ *  Record builder (course-only)
+ *  ========================= */
 function makeRecord(provider, course, option, idx) {
   const course_title = course?.courseTitle || '';
   const academic_year = course?.academicYearId || '';
@@ -153,7 +156,9 @@ function makeRecord(provider, course, option, idx) {
   return { ...slim, raw };
 }
 
-/** Build the index once */
+/** =========================
+ *  Index building (streamed)
+ *  ========================= */
 async function buildIndex() {
   if (INDEX_READY_PROMISE) return INDEX_READY_PROMISE;
   INDEX_READY_PROMISE = (async () => {
@@ -186,7 +191,9 @@ async function buildIndex() {
               idx++;
             }
           }
-        } catch {}
+        } catch {
+          // ignore malformed entry
+        }
       });
       stream.on('end', resolve);
       stream.on('error', reject);
@@ -196,7 +203,9 @@ async function buildIndex() {
   return INDEX_READY_PROMISE;
 }
 
-/** Scoring */
+/** =========================
+ *  Scoring / Retrieval
+ *  ========================= */
 function scoreDocByHits(doc, terms) {
   let score = 0;
   const nb = doc.nb || '';
@@ -208,7 +217,6 @@ function scoreDocByHits(doc, terms) {
   return score;
 }
 
-/** Retrieve top records */
 async function findRelevantData(query, opts = {}) {
   const { max = 100 } = opts;
   const q = normBase(query);
@@ -269,6 +277,7 @@ function pickNumericField(rows, questionLower) {
   return NUMERIC_FIELD_CANDIDATES.find(k => rows.some(r => !Number.isNaN(tryParseNumber(r.raw?.[k]))));
 }
 
+/** Intent within course queries */
 function detectIntent(q) {
   const s = q.toLowerCase();
   if (/\b(how many|count|number of)\b/.test(s)) return 'COUNT';
@@ -278,6 +287,30 @@ function detectIntent(q) {
   return 'LIST';
 }
 
+/** =========================
+ *  Query Router
+ *  ========================= */
+const COURSE_HINTS = [
+  // generic
+  'course','degree','programme','program','uni','university','college','campus','module','intake','start','application','code',
+  // levels / quals
+  'undergraduate','postgraduate','bachelor','masters','master','phd','mba','msc','ma','ba','bsc','beng','pg','pgce','diploma','hnd','hnc'
+];
+
+function isCourseLike(query) {
+  const s = normBase(query);
+  // quick heuristics: contains any course hint, or a pattern like "BSc in", "MSc", "BA", "Computer Science course", etc.
+  if (COURSE_HINTS.some(k => s.includes(k))) return true;
+  if (/\b(bsc|ba|msc|ma|mba|phd)\b/.test(s)) return true;
+  if (/\b(course|degree|program(me)?)\b/.test(s)) return true;
+  // simple subject + course phrasing
+  if (/\b(computer science|data science|engineering|business|law|medicine|nursing|psychology|accounting|finance)\b.*\b(course|degree|msc|bsc|ba)\b/.test(s)) return true;
+  return false;
+}
+
+/** =========================
+ *  Filters / Summaries
+ *  ========================= */
 function buildFilters(q) {
   const s = q.toLowerCase();
   const filters = [];
@@ -304,6 +337,13 @@ function buildFilters(q) {
   }
   if (/\bundergraduate|ug|bachelor|ba|bsc|hnd|hnc\b/.test(s)) {
     filters.push(rec => /(undergraduate|bachelor|ba|bsc|hnd|hnc)/.test((rec.raw?.destination || rec.raw?.qualification || '').toString().toLowerCase()));
+  }
+
+  // start month words
+  const month = (s.match(/\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/) || [])[0];
+  if (month) {
+    const m3 = month.slice(0,3).toLowerCase();
+    filters.push(rec => (rec.raw?.start_month || '').toLowerCase().startsWith(m3));
   }
 
   return filters;
@@ -337,10 +377,26 @@ function summarizeRows(rows, limit = 10) {
   return lines.join('\n');
 }
 
-/** Main high-level query over dataset */
+/** =========================
+ *  Main high-level query
+ *  ========================= */
 async function queryDataset(question, opts = {}) {
+  const courseQuery = isCourseLike(question);
+  if (!courseQuery) {
+    // Non-course → signal GENERAL so ai.js can use the LLM
+    return {
+      intent: 'GENERAL',
+      rows: [],
+      count: 0,
+      text: 'I can help with courses, universities, or intakes. Ask away—or tell me your subject and level (UG/PG)!'
+    };
+  }
+
   const retrieved = await findRelevantData(question, { max: opts.max || 200 });
-  if (!retrieved.length) return { intent: 'LIST', count: 0, rows: [], text: 'Not found in dataset.' };
+  if (!retrieved.length) {
+    // Course-like but zero hits → ai.js will LLM-fallback
+    return { intent: 'LIST', count: 0, rows: [], text: 'No exact matches in the dataset.' };
+  }
 
   const filters = buildFilters(question);
   const filtered = applyFilters(retrieved, filters);
@@ -353,14 +409,14 @@ async function queryDataset(question, opts = {}) {
   if (intent === 'AVG' || intent === 'MIN' || intent === 'MAX') {
     const field = pickNumericField(filtered, question.toLowerCase());
     if (!field) {
-      return { intent: 'LIST', rows: filtered, text: summarizeRows(filtered) };
+      return { intent: 'LIST', rows: filtered, text: summarizeRows(filtered, 5) };
     }
     const nums = filtered
       .map(r => ({ rec: r, val: tryParseNumber(r.raw?.[field]) }))
       .filter(x => !Number.isNaN(x.val));
 
     if (!nums.length) {
-      return { intent: 'LIST', rows: filtered, text: summarizeRows(filtered) };
+      return { intent: 'LIST', rows: filtered, text: summarizeRows(filtered, 5) };
     }
 
     if (intent === 'AVG') {
@@ -385,10 +441,13 @@ async function queryDataset(question, opts = {}) {
     }
   }
 
-  return { intent: 'LIST', rows: filtered, text: summarizeRows(filtered) };
+  // Default LIST intent
+  return { intent: 'LIST', rows: filtered, text: summarizeRows(filtered, 5) };
 }
 
-/** Helpers for LLM context */
+/** =========================
+ *  LLM context builder
+ *  ========================= */
 function buildRAGContext(records = []) {
   const lines = records.map((r, i) => {
     const title = r.course_title || r.raw?.course_title || 'Course';
@@ -413,6 +472,9 @@ function sanitizeLLMReply(s) {
   return s.replace(/\s+$/g, '').trim();
 }
 
+/** =========================
+ *  Exports
+ *  ========================= */
 module.exports = {
   findRelevantData,
   queryDataset,
