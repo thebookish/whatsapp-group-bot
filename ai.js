@@ -1,14 +1,15 @@
 // ai.js
 const axios = require('axios');
 const { supabase, OPENROUTER_API_KEY, NESTORIA_ENDPOINT } = require('./config');
-const { findRelevantData, sanitizeLLMReply, normBase, queryDataset } = require('./rag');
+const { sanitizeLLMReply, normBase, queryDataset } = require('./rag');
 
 /* ============================
    Onboarding & App State
 ============================= */
 const ONBOARDING_STEPS = { NAME: 1, INTERESTS: 2, GOALS: 3, COUNTRY: 4, COMPLETE: 0 };
 const GREETING_PATTERNS = /\b(hello|hi|hey)\b/i;
-const ACCO_PATTERNS = /\b(accommodation|accomodation|accommodation|rent|room|flat|house|hall|student hall|dorm|hostel)\b/i;
+const ACCO_PATTERNS = /\b(accommodation|accomodation|rent|room|flat|house|hall|student hall|dorm|hostel)\b/i;
+const MORE_PATTERNS = /^(more|next|show me more|see more)\b/i;
 
 const activeSessions = new Map();
 
@@ -20,7 +21,10 @@ function createUserProfile() {
     country: '',
     onboardingStep: ONBOARDING_STEPS.NAME,
     lastInteraction: new Date(),
-    conversationHistory: []
+    conversationHistory: [],
+    // pagination state for course lists
+    lastRows: null,
+    lastOffset: 0
   };
 }
 
@@ -101,7 +105,7 @@ async function updateUserInDB(userId, updates) {
     const { data, error } = await supabase.from('users').update({
       ...updates, last_interaction: new Date()
     }).eq('user_id', userId).select().single();
-    if (error) throw error;
+  if (error) throw error;
     return data;
   } catch (error) {
     console.error('Error updating user in DB:', error);
@@ -211,33 +215,32 @@ function formatAccommodationReply(listings) {
 }
 
 /* ============================
-   Analytics Formatter
+   Course result formatting + pagination
 ============================= */
-function formatAnalyticReply(result) {
-  if (!result) return 'Not found in dataset.';
-  const head = result.text || '';
-  if (!result.rows || !result.rows.length) return head || 'Not found in dataset.';
-
-  const previewLines = [];
-  const limit = 6;
-  for (const r of result.rows.slice(0, limit)) {
-    const uni = r.raw?.provider_name || r.provider_name || '';
-    const title = r.raw?.course_title || r.course_title || '';
-    const start = r.raw?.start_date_raw || r.start_date || '';
-    const qual = r.raw?.qualification || '';
-    const line = [
-      uni && title ? `${uni} — ${title}` : (title || uni || 'Course'),
+function formatCourseSlice(rows, start = 0, size = 5, head = '') {
+  const slice = rows.slice(start, start + size);
+  if (!slice.length) return 'No more results.';
+  const lines = slice.map(r => {
+    const title = r.raw?.course_title || r.course_title || 'Course';
+    const qual = r.raw?.qualification || r.qualification || '';
+    const campus = r.raw?.campus || r.campus || '';
+    const startDate = r.raw?.start_date_raw || r.start_date || '';
+    const app = r.raw?.application_code || r.application_code || '';
+    const bits = [
+      title,
       qual ? `(${qual})` : null,
-      start ? `starts ${start}` : null
-    ].filter(Boolean).join(' — ');
-    previewLines.push(`• ${line}`);
-  }
-  const preview = previewLines.join('\n');
-  return head ? `${head}\n${preview}` : preview;
+      campus ? `Campus: ${campus}` : null,
+      startDate ? `Start: ${startDate}` : null,
+      app ? `Code: ${app}` : null
+    ].filter(Boolean);
+    return `• ${bits.join(' — ')}`;
+  });
+  const footer = `\nWant more options? Reply "more".`;
+  return head ? `${head}\n${lines.join('\n')}${footer}` : `${lines.join('\n')}${footer}`;
 }
 
 /* ============================
-   (Optional) LLM kept for future
+   LLM (general + course fallback)
 ============================= */
 async function generateAIResponse(profile, studentMessage, conversationHistory = [], ragContext = '') {
   const historyContext = conversationHistory
@@ -246,12 +249,11 @@ async function generateAIResponse(profile, studentMessage, conversationHistory =
 
   const systemPrompt = `
 You are a helpful Student Assistant. Keep answers short and natural.
-Only rely on the context below for factual course details.
-If missing, answer generally"
-
-RAG College Data Context:
-${ragContext}
+If RAG context is provided, rely on it for factual course details.
+If it's missing or irrelevant, answer generally and helpfully.
 `.trim();
+
+  const ragBlock = ragContext ? `\nRAG Context:\n${ragContext}\n` : '';
 
   const userPrompt = `
 Student Info:
@@ -265,8 +267,7 @@ ${historyContext}
 
 Student's Latest Question:
 "${studentMessage}"
-
-Respond plainly with course suggestions from the context above.
+${ragBlock}
 `.trim();
 
   try {
@@ -297,7 +298,7 @@ Respond plainly with course suggestions from the context above.
 }
 
 /* ============================
-   Main entry (ALL Q&A → RAG → Answer)
+   Main entry (router + logic)
 ============================= */
 async function getAIResponse(userId, rawMessage) {
   try {
@@ -321,13 +322,31 @@ async function getAIResponse(userId, rawMessage) {
         country: user.country || '',
         onboardingStep: ONBOARDING_STEPS.COMPLETE,
         lastInteraction: new Date(),
-        conversationHistory: await getConversationHistory(uid)
+        conversationHistory: await getConversationHistory(uid),
+        lastRows: null,
+        lastOffset: 0
       };
       activeSessions.set(uid, profile);
       try { await updateUserInDB(uid, {}); } catch (_) {}
     } else {
       profile = createUserProfile();
       activeSessions.set(uid, profile);
+    }
+
+    // ==== "more" pagination shortcut ====
+    if (MORE_PATTERNS.test(lowerMsg) && Array.isArray(profile.lastRows) && profile.lastRows.length) {
+      const start = profile.lastOffset || 0;
+      const reply = formatCourseSlice(profile.lastRows, start, 5);
+      profile.lastOffset = Math.min(start + 5, profile.lastRows.length);
+      try { await saveConversation(uid, messageText, reply); } catch (_) {}
+      profile.conversationHistory.push({ message: messageText, response: reply, timestamp: new Date() });
+      if (profile.conversationHistory.length > 20) profile.conversationHistory.shift();
+      if (exists) { try { await updateUserInDB(uid, {}); } catch (_) {} }
+      return reply;
+    } else {
+      // reset pagination on any non-"more" message
+      profile.lastRows = null;
+      profile.lastOffset = 0;
     }
 
     // ==== ONBOARDING ====
@@ -386,10 +405,12 @@ async function getAIResponse(userId, rawMessage) {
       return reply;
     }
 
-    // ==== Dataset-first (now analytical over full JSON) ====
+    // ==== Dataset router (rag.js decides if it's GENERAL or course-like)
     const result = await queryDataset(messageText, { max: 200 });
-    if (result && (result.rows?.length || result.count !== undefined)) {
-      const reply = formatAnalyticReply(result);
+
+    // Non-course: answer with LLM (general)
+    if (result && result.intent === 'GENERAL') {
+      const reply = await generateAIResponse(profile, messageText, profile.conversationHistory, '');
       try { await saveConversation(uid, messageText, reply); } catch (_) {}
       profile.conversationHistory.push({ message: messageText, response: reply, timestamp: new Date() });
       if (profile.conversationHistory.length > 20) profile.conversationHistory.shift();
@@ -397,9 +418,33 @@ async function getAIResponse(userId, rawMessage) {
       return reply;
     }
 
-    // ==== Generic fallback (no web) ====
-    const subject = messageText;
-    const genericReply = `I don’t know exactly about this. For ${subject}, check top UK universities’ course pages (e.g., Oxford, Cambridge, Imperial, UCL, Edinburgh) and look for upcoming intakes. I can also try a nearby subject or different keyword if you want.`;
+    // Course-like: if we have rows, show up to 5 and ask if they want more
+    if (result && Array.isArray(result.rows) && result.rows.length) {
+      const head = result.text || '';
+      const reply = formatCourseSlice(result.rows, 0, 5, head);
+      // set pagination state
+      profile.lastRows = result.rows;
+      profile.lastOffset = Math.min(5, result.rows.length);
+
+      try { await saveConversation(uid, messageText, reply); } catch (_) {}
+      profile.conversationHistory.push({ message: messageText, response: reply, timestamp: new Date() });
+      if (profile.conversationHistory.length > 20) profile.conversationHistory.shift();
+      if (exists) { try { await updateUserInDB(uid, {}); } catch (_) {} }
+      return reply;
+    }
+
+    // Course-like but no dataset matches → use LLM to craft a generic helpful reply
+    if (result && (!result.rows || !result.rows.length)) {
+      const reply = await generateAIResponse(profile, messageText, profile.conversationHistory, '');
+      try { await saveConversation(uid, messageText, reply); } catch (_) {}
+      profile.conversationHistory.push({ message: messageText, response: reply, timestamp: new Date() });
+      if (profile.conversationHistory.length > 20) profile.conversationHistory.shift();
+      if (exists) { try { await updateUserInDB(uid, {}); } catch (_) {} }
+      return reply;
+    }
+
+    // ==== Final fallback
+    const genericReply = `I’m not sure yet. Tell me the subject, level (UG/PG), preferred campus/city, and start month—I'll suggest options.`;
     try { await saveConversation(uid, messageText, genericReply); } catch (_) {}
     profile.conversationHistory.push({ message: messageText, response: genericReply, timestamp: new Date() });
     if (profile.conversationHistory.length > 20) profile.conversationHistory.shift();
