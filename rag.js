@@ -105,71 +105,89 @@ function lruSet(key, val) {
 }
 
 /** Flatten provider → course → option into a single record */
-function makeRecord(provider, course, option, idx) {
-  const provider_name = provider?.name || provider?.aliasName || '';
-  const provider_city = provider?.address?.line4 || '';
-  const provider_country = provider?.address?.country?.mappedCaption || '';
-  const course_title = course?.courseTitle || '';
-  const academic_year = course?.academicYearId || '';
-  const destination = course?.routingData?.destination?.caption || '';
-  const application_code = course?.applicationCode || '';
-  const study_mode = option?.studyMode?.mappedCaption || option?.studyMode?.caption || '';
-  const duration_qty = option?.duration?.quantity ?? null;
-  const duration_unit = option?.duration?.durationType?.caption || '';
-  const campus = option?.location?.name || '';
-  const start_date_raw = option?.startDate?.date || '';
-  const start_month = monthTokenFromDate(start_date_raw); // e.g., 'sep'
-  const qualification = option?.outcomeQualification?.caption || '';
+ function makeRecord(provider, course, option, idx) {
+   const provider_name = provider?.name || provider?.aliasName || '';
+   const provider_city = provider?.address?.line4 || '';
+   const provider_country = provider?.address?.country?.mappedCaption || '';
+   const course_title = course?.courseTitle || '';
+   const academic_year = course?.academicYearId || '';
+   const destination = course?.routingData?.destination?.caption || '';
+   const application_code = course?.applicationCode || '';
+   const study_mode = option?.studyMode?.mappedCaption || option?.studyMode?.caption || '';
+   const duration_qty = option?.duration?.quantity ?? null;
+   const duration_unit = option?.duration?.durationType?.caption || '';
+   const campus = option?.location?.name || '';
+   const start_date_raw = option?.startDate?.date || '';
+   const start_month = monthTokenFromDate(start_date_raw); // e.g., 'sep'
+   const qualification = option?.outcomeQualification?.caption || '';
 
-  // Build a text blob for indexing/search
-  const textBlob = [
-    provider_name, provider_city, provider_country,
-    course_title, academic_year, destination, application_code,
-    study_mode, duration_unit, campus, start_date_raw, start_month, qualification,
-    provider?.aboutUs, provider?.whatMakesUsDifferent,
-    ...(Array.isArray(provider?.aliases) ? provider.aliases : [])
-  ].filter(Boolean).join(' ');
+   // Build a text blob for indexing/search
+   const textBlob = [
+     provider_name, provider_city, provider_country,
+     course_title, academic_year, destination, application_code,
+     study_mode, duration_unit, campus, start_date_raw, start_month, qualification,
+     provider?.aboutUs, provider?.whatMakesUsDifferent,
+     ...(Array.isArray(provider?.aliases) ? provider.aliases : [])
+   ].filter(Boolean).join(' ');
 
-  const nb = normBase(textBlob);
+   const nb = normBase(textBlob);
 
-  const slim = {
-    idx,
-    nb,
-    provider_name,
-    course_title,
-    campus,
-    mode: study_mode,
-    start_date: start_date_raw,
-    start_month,
-    duration: duration_qty != null && duration_unit ? `${duration_qty} ${duration_unit}` : (duration_qty ?? ''),
-    qualification,
-    academic_year,
-    application_code,
-  };
+   const slim = {
+     idx,
+     nb,
+     provider_name,
+     course_title,
+     campus,
+     mode: study_mode,
+     start_date: start_date_raw,
+     start_month,
+     duration: duration_qty != null && duration_unit ? `${duration_qty} ${duration_unit}` : (duration_qty ?? ''),
+     qualification,
+     academic_year,
+     application_code,
+   };
 
-  const raw = {
-    provider,
-    course,
-    option,
-    // convenient denormalized fields too:
-    provider_name,
-    provider_city,
-    provider_country,
-    course_title,
-    academic_year,
-    destination,
-    application_code,
-    study_mode,
-    duration_qty,
-    duration_unit,
-    campus,
-    start_date_raw,
-    start_month,
-    qualification,
-  };
+-  const raw = {
+-    provider,
+-    course,
+-    option,
+-    // convenient denormalized fields too:
+-    provider_name,
+-    provider_city,
+-    provider_country,
+-    course_title,
+-    academic_year,
+-    destination,
+-    application_code,
+-    study_mode,
+-    duration_qty,
+-    duration_unit,
+-    campus,
+-    start_date_raw,
+-    start_month,
+-    qualification,
+-  };
++  // Keep ONLY the small denormalized fields you actually use elsewhere.
++  const raw = {
++    provider_name,
++    provider_city,
++    provider_country,
++    course_title,
++    academic_year,
++    destination,
++    application_code,
++    study_mode,
++    duration_qty,
++    duration_unit,
++    campus,
++    start_date_raw,
++    start_month,
++    qualification,
++  };
 
-  return { ...slim, raw };
-}
+   return { ...slim, raw };
+ }
+
 
 /** Build the index once */
 async function buildIndex() {
