@@ -322,7 +322,11 @@ const conversationKey = isGroup ? `${remoteJid}_${participantId}` : remoteJid;
 
 startBot();
 // Check reminders every 30 seconds
-startReminderScheduler();
+
+// after sock is ready
+startReminderScheduler(async (userId, text) => {
+  await sock.sendMessage(userId, { text });
+});
 
 process.on('SIGINT', async () => {
   console.log('\n👋 Shutting down...');

@@ -79,23 +79,22 @@ async function markReminderSent(id) {
 /**
  * Start background reminder scheduler
  */
-function startReminderScheduler() {
+function startReminderScheduler(sendFn) {
   setInterval(async () => {
     try {
       const due = await getDueReminders();
       for (const r of due) {
         console.log("📤 Sending reminder:", r);
 
-        // Send reminder back to the user
-        await getAIResponse(r.user_id, { text: `⏰ Reminder: ${r.message}` });
+        // ✅ Use injected sender function
+        await sendFn(r.user_id, `⏰ Reminder: ${r.message}`);
 
-        // Mark as sent
         await markReminderSent(r.id);
       }
     } catch (err) {
       console.error("Reminder check error:", err);
     }
-  }, 30_000); // every 30 seconds
+  }, 30_000); // every 30s
 }
 
 module.exports = { addReminder, getDueReminders, markReminderSent, startReminderScheduler };
