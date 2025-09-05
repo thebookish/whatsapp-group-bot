@@ -1,7 +1,7 @@
 // vectorstore.js
 const fs = require('fs');
 const path = require('path');
-const Database = require('better-sqlite3');
+const Database = require('sqlite3');
 const axios = require('axios');
 const { DATA_FILE, OPENROUTER_API_KEY } = require('./config');
 
