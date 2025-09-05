@@ -321,24 +321,10 @@ const conversationKey = isGroup ? `${remoteJid}_${participantId}` : remoteJid;
 }
 
 startBot();
-// Check reminders every 30 seconds
-setInterval(async () => {
-  try {
-    const due = await getDueReminders();
-    for (const r of due) {
-      console.log("📤 Sending reminder:", r);
-
-      // Send reminder message to user
-      await sock.sendMessage(r.user_id, { text: `⏰ Reminder: ${r.message}` });
-
-      // Mark as sent
-      await markReminderSent(r.id);
-    }
-  } catch (err) {
-    console.error("Reminder check error:", err);
-  }
-}, 30000);
-
+// Start background reminder loop
+startReminderScheduler(async (userId, text) => {
+  await sendMessage(userId, text);
+});
 process.on('SIGINT', async () => {
   console.log('\n👋 Shutting down...');
   shouldStop = true;

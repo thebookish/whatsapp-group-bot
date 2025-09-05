@@ -1,92 +1,81 @@
 // reminders.js
 const { supabase } = require("./config");
+const chrono = require("chrono-node");
 
 /**
- * Add a reminder to Supabase
- */
-async function addReminder(userId, message, remindAt) {
-  try {
-    console.log("📥 addReminder called:", { userId, message, remindAt });
-
-    const { error } = await supabase
-      .from("reminders")
-      .insert([
-        {
-          user_id: userId,
-          message,
-          remind_at: new Date(remindAt).toISOString(),
-          sent: false,
-        },
-      ]);
-
-    if (error) {
-      console.error("❌ Supabase insert error:", error);
-      return null;
-    }
-
-    console.log("✅ Reminder saved in DB");
-    return { user_id: userId, message, remind_at: remindAt };
-  } catch (err) {
-    console.error("❌ addReminder unexpected error:", err);
-    return null;
-  }
-}
-
-/**
- * Fetch reminders that are due and not sent yet
+ * Find due reminders from conversations
  */
 async function getDueReminders() {
   try {
-    const now = new Date().toISOString();
+    const now = new Date();
     const { data, error } = await supabase
-      .from("reminders")
-      .select("*")
-      .lte("remind_at", now)
-      .eq("sent", false);
+      .from("conversations")
+      .select("id, user_id, message, created_at, reminder_sent")
+      .eq("reminder_sent", false);
 
     if (error) {
-      console.error("❌ Error fetching reminders:", error);
+      console.error("❌ Supabase fetch error:", error);
       return [];
     }
 
-    console.log(`⏰ Found ${data?.length || 0} due reminders`);
-    return data || [];
+    const due = [];
+    for (const row of data || []) {
+      // Only check messages starting with "remind me" or "add reminder"
+      if (!/^(remind me|add reminder)/i.test(row.message)) continue;
+
+      const parsed = chrono.parse(row.message, new Date(row.created_at));
+      if (parsed.length === 0) continue;
+
+      const remindAt = parsed[0].start.date();
+      if (remindAt <= now) {
+        // Extract the task by removing the time text
+        const textTime = parsed[0].text;
+        const task = row.message
+          .replace(/^(remind me|add reminder)/i, "")
+          .replace(textTime, "")
+          .trim();
+
+        due.push({
+          id: row.id,
+          user_id: row.user_id,
+          message: task || row.message,
+        });
+      }
+    }
+
+    console.log(`⏰ Found ${due.length} due reminders`);
+    return due;
   } catch (err) {
-    console.error("❌ getDueReminders unexpected error:", err);
+    console.error("❌ getDueReminders error:", err);
     return [];
   }
 }
 
 /**
- * Mark a reminder as sent
+ * Mark reminder as sent
  */
 async function markReminderSent(id) {
   try {
-    console.log("✔️ Marking reminder sent:", id);
-
     const { error } = await supabase
-      .from("reminders")
-      .update({ sent: true })
+      .from("conversations")
+      .update({ reminder_sent: true })
       .eq("id", id);
 
-    if (error) {
-      console.error("❌ Error marking reminder sent:", error);
-    }
+    if (error) console.error("❌ Error marking reminder sent:", error);
   } catch (err) {
-    console.error("❌ markReminderSent unexpected error:", err);
+    console.error("❌ markReminderSent error:", err);
   }
 }
 
 /**
- * Start background scheduler to check due reminders and send them
- * @param {Function} sendFn - async function (userId, message) => {}
+ * Start background scheduler
  */
 function startReminderScheduler(sendFn, intervalMs = 60000) {
-  console.log("⏳ Reminder scheduler started (interval:", intervalMs, "ms)");
+  console.log("⏳ Reminder scheduler started, interval", intervalMs);
 
   setInterval(async () => {
-    const dueReminders = await getDueReminders();
-    for (const r of dueReminders) {
+    const due = await getDueReminders();
+    for (const r of due) {
       try {
         await sendFn(r.user_id, `⏰ Reminder: ${r.message}`);
         await markReminderSent(r.id);
@@ -97,9 +86,4 @@ function startReminderScheduler(sendFn, intervalMs = 60000) {
   }, intervalMs);
 }
 
-module.exports = {
-  addReminder,
-  getDueReminders,
-  markReminderSent,
-  startReminderScheduler,
-};
+module.exports = { startReminderScheduler };
