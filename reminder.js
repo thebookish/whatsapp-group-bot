@@ -19,17 +19,18 @@ async function addReminder(userId, message, remindAt) {
       .select();
 
     if (error) {
-      console.error('❌ Error adding reminder:', error);
+      console.error('❌ Supabase insert error:', error);
       return null;
     }
 
-    console.log('✅ Reminder saved:', data);
+    console.log('✅ Reminder saved in DB:', data);
     return data?.[0] || null;
   } catch (err) {
     console.error("❌ addReminder unexpected error:", err);
     return null;
   }
 }
+
 
 /**
  * Fetch reminders that are due and not sent yet

@@ -334,23 +334,31 @@ async function getAIResponse(userId, rawMessage) {
       activeSessions.set(uid, profile);
     }
 
-    /* ==== Reminder detection ==== */
-    if (/^remind me\b/i.test(messageText)) {
-      const date = chrono.parseDate(messageText);
-      console.log("🕑 Parsed reminder date:", date);
+  if (/^(remind me|add reminder)\b/i.test(messageText)) {
+  const parsed = chrono.parse(messageText);
+  let date = null;
+  let task = null;
 
-      if (!date) {
-        return "I couldn’t detect a valid time. Try: 'remind me tomorrow at 9am to check mail'.";
-      }
+  if (parsed.length > 0) {
+    date = parsed[0].start.date();
+    const textTime = parsed[0].text;
+    task = messageText
+      .replace(/^(remind me|add reminder)\b/i, '')
+      .replace(textTime, '')
+      .trim();
+  }
 
-      const task = messageText.replace(/^remind me\b/i, '').trim();
-      if (!task) {
-        return "What should I remind you about?";
-      }
+  if (!date) {
+    return "I couldn’t detect a valid time. Try: 'remind me tomorrow at 9am to check mail'.";
+  }
+  if (!task) {
+    return "What should I remind you about?";
+  }
 
-      await addReminder(uid, task, date);   // store in Supabase
-      return `✅ Got it! I’ll remind you to *${task}* at ${date.toLocaleString()}.`;
-    }
+  await addReminder(uid, task, date);
+  return `✅ Got it! I’ll remind you to *${task}* at ${date.toLocaleString()}.`;
+}
+    
 
     /* ==== "more" pagination shortcut ==== */
     if (MORE_PATTERNS.test(lowerMsg) && Array.isArray(profile.lastRows) && profile.lastRows.length) {
