@@ -220,23 +220,24 @@ function formatAccommodationReply(listings) {
 function formatCourseSlice(rows, start = 0, size = 5, head = '') {
   const slice = rows.slice(start, start + size);
   if (!slice.length) return 'No more results.';
+
   const lines = slice.map(r => {
     const title = r.raw?.course_title || r.course_title || 'Course';
     const qual = r.raw?.qualification || r.qualification || '';
     const campus = r.raw?.campus || r.campus || '';
     const startDate = r.raw?.start_date_raw || r.start_date || '';
     const app = r.raw?.application_code || r.application_code || '';
-    const bits = [
-      title,
-      qual ? `(${qual})` : null,
-      campus ? `Campus: ${campus}` : null,
-      startDate ? `Start: ${startDate}` : null,
-      app ? `Code: ${app}` : null
-    ].filter(Boolean);
-    return `• ${bits.join(' — ')}`;
+
+    let out = `*${title}*`;
+    if (qual) out += `\n  Qualification: ${qual}`;
+    if (campus) out += `\n  Campus: ${campus}`;
+    if (startDate) out += `\n  Start: ${startDate}`;
+    if (app) out += `\n  Code: ${app}`;
+    return out;
   });
-  const footer = `\nWant more options? Reply "more".`;
-  return head ? `${head}\n${lines.join('\n')}${footer}` : `${lines.join('\n')}${footer}`;
+
+  const footer = `\n\nReply "more" to see more options.`;
+  return head ? `${head}\n\n${lines.join('\n\n')}${footer}` : `${lines.join('\n\n')}${footer}`;
 }
 
 /* ============================

@@ -16,6 +16,7 @@
     "express": "^4.18.2",
     "multer": "^2.0.2",
     "node-cron": "^4.2.1",
+    "openai": "^5.19.1",
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",
     "stream-chain": "^3.4.0",
