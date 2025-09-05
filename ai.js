@@ -1,7 +1,7 @@
 const axios = require('axios');
 const { supabase, OPENROUTER_API_KEY, NESTORIA_ENDPOINT } = require('./config');
 const { normBase, queryDataset } = require('./rag');
-const { addReminder } = require('./reminders');   // make sure file is reminders.js
+const { addReminder } = require('./reminder');   // make sure file is reminders.js
 const chrono = require('chrono-node');
 
 /* ============================
