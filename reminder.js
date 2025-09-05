@@ -1,7 +1,6 @@
 // reminders.js
-const { supabase } = require("./config");
-const chrono = require("chrono-node");
-
+const { supabase } = require('./config');
+const { getAIResponse } = require('./ai'); // ✅ so we can send reminder messages
 
 /**
  * Add a reminder to Supabase
@@ -10,111 +9,93 @@ async function addReminder(userId, message, remindAt) {
   try {
     console.log("📥 addReminder called:", { userId, message, remindAt });
 
-    const { error } = await supabase
-      .from("reminders")
-      .insert([
-        {
-          user_id: userId,
-          message,
-          remind_at: new Date(remindAt).toISOString(),
-          sent: false,
-        },
-      ]);
+    const { data, error } = await supabase
+      .from('reminders')
+      .insert([{
+        user_id: userId,
+        message,
+        remind_at: new Date(remindAt).toISOString(),
+        sent: false
+      }]);
 
     if (error) {
-      console.error("❌ Supabase insert error:", error);
+      console.error('❌ Error adding reminder:', error);
       return null;
     }
 
-    console.log("✅ Reminder saved in DB");
-    return { user_id: userId, message, remind_at: remindAt };
+    console.log('✅ Reminder saved:', data);
+    return data?.[0] || null;
   } catch (err) {
     console.error("❌ addReminder unexpected error:", err);
     return null;
   }
 }
+
 /**
- * Find due reminders from conversations
+ * Fetch reminders that are due and not sent yet
  */
 async function getDueReminders() {
   try {
-    const now = new Date();
+    const now = new Date().toISOString();
     const { data, error } = await supabase
-      .from("conversations")
-      .select("id, user_id, message, created_at, reminder_sent")
-      .eq("reminder_sent", false);
+      .from('reminders')
+      .select('*')
+      .lte('remind_at', now)
+      .eq('sent', false);
 
     if (error) {
-      console.error("❌ Supabase fetch error:", error);
+      console.error('❌ Error fetching reminders:', error);
       return [];
     }
 
-    const due = [];
-    for (const row of data || []) {
-      // Only check messages starting with "remind me" or "add reminder"
-      if (!/^(remind me|add reminder)/i.test(row.message)) continue;
-
-      const parsed = chrono.parse(row.message, new Date(row.created_at));
-      if (parsed.length === 0) continue;
-
-      const remindAt = parsed[0].start.date();
-      if (remindAt <= now) {
-        // Extract the task by removing the time text
-        const textTime = parsed[0].text;
-        const task = row.message
-          .replace(/^(remind me|add reminder)/i, "")
-          .replace(textTime, "")
-          .trim();
-
-        due.push({
-          id: row.id,
-          user_id: row.user_id,
-          message: task || row.message,
-        });
-      }
-    }
-
-    console.log(`⏰ Found ${due.length} due reminders`);
-    return due;
+    console.log(`⏰ Found ${data?.length || 0} due reminders`);
+    return data || [];
   } catch (err) {
-    console.error("❌ getDueReminders error:", err);
+    console.error("❌ getDueReminders unexpected error:", err);
     return [];
   }
 }
 
 /**
- * Mark reminder as sent
+ * Mark a reminder as sent
  */
 async function markReminderSent(id) {
   try {
-    const { error } = await supabase
-      .from("conversations")
-      .update({ reminder_sent: true })
-      .eq("id", id);
+    console.log("✔️ Marking reminder sent:", id);
 
-    if (error) console.error("❌ Error marking reminder sent:", error);
+    const { error } = await supabase
+      .from('reminders')
+      .update({ sent: true })
+      .eq('id', id);
+
+    if (error) {
+      console.error('❌ Error marking reminder sent:', error);
+    }
   } catch (err) {
-    console.error("❌ markReminderSent error:", err);
+    console.error("❌ markReminderSent unexpected error:", err);
   }
 }
 
 /**
- * Start background scheduler
+ * Start background reminder scheduler
  */
-function startReminderScheduler(sendFn, intervalMs = 60000) {
-  console.log("⏳ Reminder scheduler started, interval", intervalMs);
-
+function startReminderScheduler() {
   setInterval(async () => {
-    const due = await getDueReminders();
-    for (const r of due) {
-      try {
-        await sendFn(r.user_id, `⏰ Reminder: ${r.message}`);
+    try {
+      const due = await getDueReminders();
+      for (const r of due) {
+        console.log("📤 Sending reminder:", r);
+
+        // Send reminder back to the user
+        await getAIResponse(r.user_id, { text: `⏰ Reminder: ${r.message}` });
+
+        // Mark as sent
         await markReminderSent(r.id);
-      } catch (err) {
-        console.error("❌ Failed to send reminder:", err);
       }
+    } catch (err) {
+      console.error("Reminder check error:", err);
     }
-  }, intervalMs);
+  }, 30_000); // every 30 seconds
 }
 
-module.exports = {addReminder, startReminderScheduler,getDueReminders, markReminderSent };
+module.exports = { addReminder, getDueReminders, markReminderSent, startReminderScheduler };
