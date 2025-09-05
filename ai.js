@@ -167,10 +167,10 @@ async function handleReminder(uid, messageText) {
     return "What should I remind you about?";
   }
 
-  const saved = await addReminder(uid, task, date);
-  if (!saved) {
-    return "❌ Failed to save reminder. Please try again.";
-  }
+  await addReminder(uid, task, date);
+  // if (!saved) {
+  //   return "❌ Failed to save reminder. Please try again.";
+  // }
 
   return `✅ Got it! I’ll remind you to *${task}* at ${date.toLocaleString()}.`;
 }
