@@ -1,9 +1,8 @@
-// ai.js
 const axios = require('axios');
 const { supabase, OPENROUTER_API_KEY, NESTORIA_ENDPOINT } = require('./config');
-const {  normBase, queryDataset } = require('./rag');
-const { addReminder } = require('./reminder');
-const chrono = require('chrono-node'); // npm install chrono-node
+const { normBase, queryDataset } = require('./rag');
+const { addReminder } = require('./reminders');   // ✅ fixed require path (plural)
+const chrono = require('chrono-node');            // npm install chrono-node
 
 /* ============================
    Onboarding & App State
@@ -24,7 +23,6 @@ function createUserProfile() {
     onboardingStep: ONBOARDING_STEPS.NAME,
     lastInteraction: new Date(),
     conversationHistory: [],
-    // pagination state for course lists
     lastRows: null,
     lastOffset: 0
   };
@@ -107,7 +105,7 @@ async function updateUserInDB(userId, updates) {
     const { data, error } = await supabase.from('users').update({
       ...updates, last_interaction: new Date()
     }).eq('user_id', userId).select().single();
-  if (error) throw error;
+    if (error) throw error;
     return data;
   } catch (error) {
     console.error('Error updating user in DB:', error);
@@ -335,22 +333,26 @@ async function getAIResponse(userId, rawMessage) {
       profile = createUserProfile();
       activeSessions.set(uid, profile);
     }
-// ==== Reminder detection ====
-if (/^remind me\b/i.test(messageText)) {
-  const date = chrono.parseDate(messageText);
-  if (!date) {
-    return "I couldn’t detect a valid time. Try: 'remind me tomorrow at 9am to check mail'.";
-  }
 
-  const task = messageText.replace(/^remind me\b/i, '').trim();
-  if (!task) {
-    return "What should I remind you about?";
-  }
+    /* ==== Reminder detection ==== */
+    if (/^remind me\b/i.test(messageText)) {
+      const date = chrono.parseDate(messageText);
+      console.log("🕑 Parsed reminder date:", date);
 
-  await addReminder(uid, task, date);   // <-- this should insert into Supabase
-  return `✅ Got it! I’ll remind you to *${task}* at ${date.toLocaleString()}.`;
-}
-    // ==== "more" pagination shortcut ====
+      if (!date) {
+        return "I couldn’t detect a valid time. Try: 'remind me tomorrow at 9am to check mail'.";
+      }
+
+      const task = messageText.replace(/^remind me\b/i, '').trim();
+      if (!task) {
+        return "What should I remind you about?";
+      }
+
+      await addReminder(uid, task, date);   // store in Supabase
+      return `✅ Got it! I’ll remind you to *${task}* at ${date.toLocaleString()}.`;
+    }
+
+    /* ==== "more" pagination shortcut ==== */
     if (MORE_PATTERNS.test(lowerMsg) && Array.isArray(profile.lastRows) && profile.lastRows.length) {
       const start = profile.lastOffset || 0;
       const reply = formatCourseSlice(profile.lastRows, start, 5);
@@ -361,12 +363,11 @@ if (/^remind me\b/i.test(messageText)) {
       if (exists) { try { await updateUserInDB(uid, {}); } catch (_) {} }
       return reply;
     } else {
-      // reset pagination on any non-"more" message
       profile.lastRows = null;
       profile.lastOffset = 0;
     }
 
-    // ==== ONBOARDING ====
+    /* ==== ONBOARDING ==== */
     if (profile.onboardingStep !== ONBOARDING_STEPS.COMPLETE) {
       switch (profile.onboardingStep) {
         case ONBOARDING_STEPS.NAME: {
@@ -402,12 +403,12 @@ if (/^remind me\b/i.test(messageText)) {
       }
     }
 
-    // ==== Greeting shortcut ====
+    /* ==== Greeting shortcut ==== */
     if (GREETING_PATTERNS.test(lowerMsg)) {
       return `Hey ${profile.name || 'there'} 👋 How can I help?`;
     }
 
-    // ==== Accommodation (live lookups) ====
+    /* ==== Accommodation ==== */
     if (ACCO_PATTERNS.test(lowerMsg)) {
       const prefs = parseAccommodationQuery(messageText);
       if (!prefs.place_name) {
@@ -422,10 +423,9 @@ if (/^remind me\b/i.test(messageText)) {
       return reply;
     }
 
-    // ==== Dataset router (rag.js decides if it's GENERAL or course-like)
+    /* ==== Dataset (rag.js) ==== */
     const result = await queryDataset(messageText, { max: 200 });
 
-    // Non-course: answer with LLM (general)
     if (result && result.intent === 'GENERAL') {
       const reply = await generateAIResponse(profile, messageText, profile.conversationHistory, '');
       try { await saveConversation(uid, messageText, reply); } catch (_) {}
@@ -435,11 +435,9 @@ if (/^remind me\b/i.test(messageText)) {
       return reply;
     }
 
-    // Course-like: if we have rows, show up to 5 and ask if they want more
     if (result && Array.isArray(result.rows) && result.rows.length) {
       const head = result.text || '';
       const reply = formatCourseSlice(result.rows, 0, 5, head);
-      // set pagination state
       profile.lastRows = result.rows;
       profile.lastOffset = Math.min(5, result.rows.length);
 
@@ -450,7 +448,6 @@ if (/^remind me\b/i.test(messageText)) {
       return reply;
     }
 
-    // Course-like but no dataset matches → use LLM to craft a generic helpful reply
     if (result && (!result.rows || !result.rows.length)) {
       const reply = await generateAIResponse(profile, messageText, profile.conversationHistory, '');
       try { await saveConversation(uid, messageText, reply); } catch (_) {}
@@ -460,7 +457,6 @@ if (/^remind me\b/i.test(messageText)) {
       return reply;
     }
 
-    // ==== Final fallback
     const genericReply = `I’m not sure yet. Tell me the subject, level (UG/PG), preferred campus/city, and start month—I'll suggest options.`;
     try { await saveConversation(uid, messageText, genericReply); } catch (_) {}
     profile.conversationHistory.push({ message: messageText, response: genericReply, timestamp: new Date() });

@@ -1,40 +1,79 @@
 // reminders.js
 const { supabase } = require('./config');
 
+/**
+ * Add a reminder to Supabase
+ */
 async function addReminder(userId, message, remindAt) {
-  const { data, error } = await supabase.from('reminders').insert([{
-    user_id: userId,
-    message,
-    remind_at: new Date(remindAt).toISOString()
-  }]);
-  if (error) {
-    console.error('Error adding reminder:', error);
-  } else {
-    console.log('✅ Reminder saved in Supabase:', data);
+  try {
+    console.log("📥 addReminder called:", { userId, message, remindAt });
+
+    const { data, error } = await supabase
+      .from('reminders')
+      .insert([{
+        user_id: userId,
+        message,
+        remind_at: new Date(remindAt).toISOString(),
+        sent: false
+      }])
+      .select();
+
+    if (error) {
+      console.error('❌ Error adding reminder:', error);
+      return null;
+    }
+
+    console.log('✅ Reminder saved:', data);
+    return data?.[0] || null;
+  } catch (err) {
+    console.error("❌ addReminder unexpected error:", err);
+    return null;
   }
 }
 
+/**
+ * Fetch reminders that are due and not sent yet
+ */
 async function getDueReminders() {
-  const now = new Date().toISOString();
-  const { data, error } = await supabase
-    .from('reminders')
-    .select('*')
-    .lte('remind_at', now)
-    .eq('sent', false);
+  try {
+    const now = new Date().toISOString();
+    const { data, error } = await supabase
+      .from('reminders')
+      .select('*')
+      .lte('remind_at', now)
+      .eq('sent', false);
 
-  if (error) {
-    console.error('Error fetching reminders:', error);
+    if (error) {
+      console.error('❌ Error fetching reminders:', error);
+      return [];
+    }
+
+    console.log(`⏰ Found ${data?.length || 0} due reminders`);
+    return data || [];
+  } catch (err) {
+    console.error("❌ getDueReminders unexpected error:", err);
     return [];
   }
-  return data || [];
 }
 
+/**
+ * Mark a reminder as sent
+ */
 async function markReminderSent(id) {
-  const { error } = await supabase
-    .from('reminders')
-    .update({ sent: true })
-    .eq('id', id);
-  if (error) console.error('Error marking reminder sent:', error);
+  try {
+    console.log("✔️ Marking reminder sent:", id);
+
+    const { error } = await supabase
+      .from('reminders')
+      .update({ sent: true })
+      .eq('id', id);
+
+    if (error) {
+      console.error('❌ Error marking reminder sent:', error);
+    }
+  } catch (err) {
+    console.error("❌ markReminderSent unexpected error:", err);
+  }
 }
 
 module.exports = { addReminder, getDueReminders, markReminderSent };
