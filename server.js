@@ -333,7 +333,7 @@ setInterval(async () => {
   } catch (err) {
     console.error("Reminder check error:", err);
   }
-}, 60000);
+}, 30000);
 
 process.on('SIGINT', async () => {
   console.log('\n👋 Shutting down...');

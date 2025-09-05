@@ -2,12 +2,16 @@
 const { supabase } = require('./config');
 
 async function addReminder(userId, message, remindAt) {
-  const { error } = await supabase.from('reminders').insert([{
+  const { data, error } = await supabase.from('reminders').insert([{
     user_id: userId,
     message,
     remind_at: new Date(remindAt).toISOString()
   }]);
-  if (error) console.error('Error adding reminder:', error);
+  if (error) {
+    console.error('Error adding reminder:', error);
+  } else {
+    console.log('✅ Reminder saved in Supabase:', data);
+  }
 }
 
 async function getDueReminders() {

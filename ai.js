@@ -335,7 +335,21 @@ async function getAIResponse(userId, rawMessage) {
       profile = createUserProfile();
       activeSessions.set(uid, profile);
     }
+// ==== Reminder detection ====
+if (/^remind me\b/i.test(messageText)) {
+  const date = chrono.parseDate(messageText);
+  if (!date) {
+    return "I couldn’t detect a valid time. Try: 'remind me tomorrow at 9am to check mail'.";
+  }
 
+  const task = messageText.replace(/^remind me\b/i, '').trim();
+  if (!task) {
+    return "What should I remind you about?";
+  }
+
+  await addReminder(uid, task, date);   // <-- this should insert into Supabase
+  return `✅ Got it! I’ll remind you to *${task}* at ${date.toLocaleString()}.`;
+}
     // ==== "more" pagination shortcut ====
     if (MORE_PATTERNS.test(lowerMsg) && Array.isArray(profile.lastRows) && profile.lastRows.length) {
       const start = profile.lastOffset || 0;
@@ -392,21 +406,6 @@ async function getAIResponse(userId, rawMessage) {
     if (GREETING_PATTERNS.test(lowerMsg)) {
       return `Hey ${profile.name || 'there'} 👋 How can I help?`;
     }
-// ==== Reminder detection ====
-if (/^remind me\b/i.test(messageText)) {
-  const date = chrono.parseDate(messageText);
-  if (!date) {
-    return "I couldn’t detect a valid time. Try: 'remind me tomorrow at 9am to check mail'.";
-  }
-
-  const task = messageText.replace(/^remind me\b/i, '').trim();
-  if (!task) {
-    return "What should I remind you about?";
-  }
-
-  await addReminder(uid, task, date);
-  return `✅ Got it! I’ll remind you to *${task}* at ${date.toLocaleString()}.`;
-}
 
     // ==== Accommodation (live lookups) ====
     if (ACCO_PATTERNS.test(lowerMsg)) {
