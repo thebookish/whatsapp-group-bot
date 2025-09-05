@@ -8,7 +8,7 @@ const {
 } = require('@whiskeysockets/baileys');
 const { getAIResponse } = require('./ai');
 const { WebSocketServer } = require('ws');
-
+const { getDueReminders, markReminderSent } = require('./reminders');
 const app = express();
 const PORT = 3000;
 const AUTH_DIR = 'auth_info_baileys';
@@ -321,6 +321,19 @@ const conversationKey = isGroup ? `${remoteJid}_${participantId}` : remoteJid;
 }
 
 startBot();
+// Check reminders every minute
+setInterval(async () => {
+  try {
+    const due = await getDueReminders();
+    for (const r of due) {
+      await sock.sendMessage(r.user_id, { text: `⏰ Reminder: ${r.message}` });
+      await markReminderSent(r.id);
+      console.log(`📤 Sent reminder to ${r.user_id}: ${r.message}`);
+    }
+  } catch (err) {
+    console.error("Reminder check error:", err);
+  }
+}, 60000);
 
 process.on('SIGINT', async () => {
   console.log('\n👋 Shutting down...');
