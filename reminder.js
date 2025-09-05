@@ -2,6 +2,37 @@
 const { supabase } = require("./config");
 const chrono = require("chrono-node");
 
+
+/**
+ * Add a reminder to Supabase
+ */
+async function addReminder(userId, message, remindAt) {
+  try {
+    console.log("📥 addReminder called:", { userId, message, remindAt });
+
+    const { error } = await supabase
+      .from("reminders")
+      .insert([
+        {
+          user_id: userId,
+          message,
+          remind_at: new Date(remindAt).toISOString(),
+          sent: false,
+        },
+      ]);
+
+    if (error) {
+      console.error("❌ Supabase insert error:", error);
+      return null;
+    }
+
+    console.log("✅ Reminder saved in DB");
+    return { user_id: userId, message, remind_at: remindAt };
+  } catch (err) {
+    console.error("❌ addReminder unexpected error:", err);
+    return null;
+  }
+}
 /**
  * Find due reminders from conversations
  */
@@ -86,4 +117,4 @@ function startReminderScheduler(sendFn, intervalMs = 60000) {
   }, intervalMs);
 }
 
-module.exports = { startReminderScheduler,getDueReminders, markReminderSent };
+module.exports = {addReminder, startReminderScheduler,getDueReminders, markReminderSent };
