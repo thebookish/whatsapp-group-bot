@@ -123,4 +123,5 @@ async function queryCourses(userQuery, k = 10) {
   return data;
 }
 
-module.exports = { buildVectorStore, queryCourses };
+module.exports = { buildVectorStore, queryCourses, getEmbeddingsBatch };
+
