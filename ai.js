@@ -2,7 +2,7 @@
 const axios = require('axios');
 const { supabase, OPENROUTER_API_KEY, NESTORIA_ENDPOINT } = require('./config');
 const {  normBase, queryDataset } = require('./rag');
-const { addReminder } = require('./reminders');
+const { addReminder } = require('./reminder');
 const chrono = require('chrono-node'); // npm install chrono-node
 
 /* ============================

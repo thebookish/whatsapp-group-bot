@@ -8,7 +8,7 @@ const {
 } = require('@whiskeysockets/baileys');
 const { getAIResponse } = require('./ai');
 const { WebSocketServer } = require('ws');
-const { getDueReminders, markReminderSent } = require('./reminders');
+const { getDueReminders, markReminderSent } = require('./reminder');
 const app = express();
 const PORT = 3000;
 const AUTH_DIR = 'auth_info_baileys';
