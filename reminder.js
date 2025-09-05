@@ -86,4 +86,4 @@ function startReminderScheduler(sendFn, intervalMs = 60000) {
   }, intervalMs);
 }
 
-module.exports = { startReminderScheduler };
+module.exports = { startReminderScheduler,getDueReminders, markReminderSent };
