@@ -329,7 +329,7 @@ setInterval(async () => {
       console.log("📤 Sending reminder:", r);
 
       // Send reminder message to user
-      await sock.getAIResponse(r.user_id, { text: `⏰ Reminder: ${r.message}` });
+      await getAIResponse(r.user_id, { text: `⏰ Reminder: ${r.message}` });
 
       // Mark as sent
       await markReminderSent(r.id);
