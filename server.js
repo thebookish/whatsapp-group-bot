@@ -323,7 +323,7 @@ const conversationKey = isGroup ? `${remoteJid}_${participantId}` : remoteJid;
 startBot();
 // Start background reminder loop
 startReminderScheduler(async (userId, text) => {
-  await sendMessage(userId, text);
+  await getAIResponse(userId, text);
 });
 process.on('SIGINT', async () => {
   console.log('\n👋 Shutting down...');
