@@ -51,15 +51,20 @@ function extractTextFromMessage(message) {
   if (!message) return null;
   if (typeof message === "string") return message.trim();
   if (typeof message.conversation === "string") return message.conversation.trim();
+  if (message.message?.conversation) return message.message.conversation.trim();
   if (message.extendedTextMessage?.text) return message.extendedTextMessage.text.trim();
+  if (message.message?.extendedTextMessage?.text) return message.message.extendedTextMessage.text.trim();
   if (message.imageMessage?.caption) return message.imageMessage.caption.trim();
+  if (message.message?.imageMessage?.caption) return message.message.imageMessage.caption.trim();
   if (message.videoMessage?.caption) return message.videoMessage.caption.trim();
+  if (message.message?.videoMessage?.caption) return message.message.videoMessage.caption.trim();
   if (message.text) {
     if (typeof message.text === "string") return message.text.trim();
     if (message.text.body) return message.text.body.trim();
   }
   return null;
 }
+
 
 function validateUserId(userId) {
   if (!userId || typeof userId !== "string") throw new Error("Invalid userId");
