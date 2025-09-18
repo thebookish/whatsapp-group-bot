@@ -404,6 +404,26 @@ async function getAIResponse(userId, rawMessage) {
       const topic = topicMatch ? topicMatch[1].trim() : "";
       return await handleConnectIntent({ requesterId: uid, topic, radiusKm: 10 });
     }
+// ==== Discoverability toggles ====
+if (/make me discoverable/i.test(messageText)) {
+  const { error } = await supabase
+    .from("users")
+    .update({ discoverable: true })
+    .eq("user_id", uid);
+  return error
+    ? "Could not update discoverability."
+    : "✅ You’re now discoverable to nearby students.";
+}
+
+if (/stop discoverable|hide me|make me invisible/i.test(messageText)) {
+  const { error } = await supabase
+    .from("users")
+    .update({ discoverable: false })
+    .eq("user_id", uid);
+  return error
+    ? "Could not update discoverability."
+    : "👌 Got it. You’re no longer discoverable.";
+}
 
     /* ==== Reminder ==== */
     if (/^(remind me|add reminder)\b/i.test(messageText)) {

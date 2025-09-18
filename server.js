@@ -1,3 +1,4 @@
+// server.js
 const express = require('express');
 const path = require('path');
 const {
@@ -11,11 +12,11 @@ const { WebSocketServer } = require('ws');
 const { startReminderScheduler } = require('./reminder');
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 const AUTH_DIR = 'auth_info_baileys';
 const KEEP_ALIVE_MS = 10000;
 const TRIGGER_KEYWORD = 'heybot';
-const CONVERSATION_TIMEOUT = 30 * 60 * 1000;
+const CONVERSATION_TIMEOUT = 30 * 60 * 1000; // 30 min
 
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('/health', (req, res) => res.json({ ok: true }));
@@ -32,6 +33,9 @@ function broadcast(data) {
   });
 }
 
+/* ============================
+   State
+============================= */
 let sock = null;
 let saveCreds = null;
 let isStarting = false;
@@ -44,10 +48,15 @@ let activeConversations = new Map();
 ============================= */
 function extractTextFromMessage(message) {
   if (!message) return '';
+  if (typeof message === 'string') return message;
   if (typeof message.conversation === 'string') return message.conversation;
+  if (message.message?.conversation) return message.message.conversation;
   if (typeof message.extendedTextMessage?.text === 'string') return message.extendedTextMessage.text;
+  if (message.message?.extendedTextMessage?.text) return message.message.extendedTextMessage.text;
   if (typeof message.imageMessage?.caption === 'string') return message.imageMessage.caption;
+  if (message.message?.imageMessage?.caption) return message.message.imageMessage.caption;
   if (typeof message.videoMessage?.caption === 'string') return message.videoMessage.caption;
+  if (message.message?.videoMessage?.caption) return message.message.videoMessage.caption;
   if (typeof message.buttonsResponseMessage?.selectedButtonId === 'string') return message.buttonsResponseMessage.selectedButtonId;
   if (typeof message.listResponseMessage?.singleSelectReply?.selectedRowId === 'string') return message.listResponseMessage.singleSelectReply.selectedRowId;
   if (message?.text?.body) return message.text.body;
@@ -57,15 +66,19 @@ function extractTextFromMessage(message) {
 function isBotMentioned(message, botJid) {
   if (!message || !botJid) return false;
   if (message.extendedTextMessage?.contextInfo?.mentionedJid?.includes(botJid)) return true;
+  if (message.message?.extendedTextMessage?.contextInfo?.mentionedJid?.includes(botJid)) return true;
   if (message.contextInfo?.mentionedJid?.includes(botJid)) return true;
   return false;
 }
 
 function isBotRepliedTo(message, botJid) {
   if (!message || !botJid) return false;
-  const quotedMsg = message.extendedTextMessage?.contextInfo?.quotedMessage;
-  const stanzaId = message.extendedTextMessage?.contextInfo?.stanzaId;
-  const participant = message.extendedTextMessage?.contextInfo?.participant;
+  const quotedMsg = message.extendedTextMessage?.contextInfo?.quotedMessage
+    || message.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+  const stanzaId = message.extendedTextMessage?.contextInfo?.stanzaId
+    || message.message?.extendedTextMessage?.contextInfo?.stanzaId;
+  const participant = message.extendedTextMessage?.contextInfo?.participant
+    || message.message?.extendedTextMessage?.contextInfo?.participant;
   if (participant === botJid || (quotedMsg && stanzaId)) return true;
   return false;
 }
@@ -106,9 +119,7 @@ async function startBot() {
     saveCreds = _saveCreds;
 
     if (sock) {
-      try {
-        if (sock.ws && sock.ws.readyState === 1) await sock.end();
-      } catch {}
+      try { if (sock.ws && sock.ws.readyState === 1) await sock.end(); } catch {}
       sock = null;
     }
 
@@ -120,12 +131,8 @@ async function startBot() {
 
     /* === init match system with send + createGroup === */
     initMatch({
-      send: async (jid, text) => {
-        await sock.sendMessage(jid, { text });
-      },
-      createGroup: async (subject, jids) => {
-        return await sock.groupCreate(subject, jids);
-      },
+      send: async (jid, text) => { await sock.sendMessage(jid, { text }); },
+      createGroup: async (subject, jids) => await sock.groupCreate(subject, jids),
     });
 
     sock.ev.on('connection.update', (update) => {
@@ -160,7 +167,7 @@ async function startBot() {
 
     sock.ev.on('creds.update', saveCreds);
 
-    // Handle messages
+    /* === Handle messages === */
     sock.ev.on('messages.upsert', async ({ messages }) => {
       try {
         if (!messages?.[0] || messages[0].key.fromMe) return;
@@ -175,8 +182,7 @@ async function startBot() {
         const conversationKey = isGroup ? `${remoteJid}_${participantId}` : remoteJid;
 
         let text = extractTextFromMessage(msg.message);
-        if (!text?.trim()) return;
-        text = text.trim();
+        if (text) text = text.trim();
 
         let shouldRespond = false;
         let sendPrivately = false;
@@ -184,24 +190,20 @@ async function startBot() {
 
         if (isGroup) {
           const conversationActive = isConversationActive(conversationKey);
-          const startsWithTrigger = text.toLowerCase().startsWith(TRIGGER_KEYWORD.toLowerCase());
-
+          const startsWithTrigger = text?.toLowerCase().startsWith(TRIGGER_KEYWORD.toLowerCase());
           if (startsWithTrigger) {
-            if (!conversationActive) {
-              startConversation(conversationKey);
-              isNewConversation = true;
-            }
+            if (!conversationActive) { startConversation(conversationKey); isNewConversation = true; }
             shouldRespond = true;
             text = text.slice(TRIGGER_KEYWORD.length).trim();
-            console.log(`🎯 Trigger word used in group ${groupId} by ${participantId}`);
+            console.log(`🎯 Trigger in ${groupId} by ${participantId}`);
           } else if (conversationActive) {
             const isMentioned = isBotMentioned(msg.message, botJid);
             const isRepliedTo = isBotRepliedTo(msg.message, botJid);
             if (isMentioned || isRepliedTo) {
               shouldRespond = true;
               updateConversationActivity(conversationKey);
-              console.log(`🎯 Bot ${isMentioned ? 'mentioned' : 'replied to'} in active conversation ${conversationKey}`);
-              if (isMentioned) text = text.replace(/@\d+/g, '').trim();
+              console.log(`🎯 Bot ${isMentioned ? 'mentioned' : 'replied'} in ${conversationKey}`);
+              if (isMentioned && text) text = text.replace(/@\d+/g, '').trim();
             }
           }
           if (shouldRespond && /reply\s+me\s+privately|dm\s+me|private\s+reply/i.test(text)) {
@@ -209,38 +211,37 @@ async function startBot() {
             text = text.replace(/reply\s+me\s+privately|dm\s+me|private\s+reply/gi, '').trim();
           }
         } else {
-          if (!isConversationActive(conversationKey)) {
-            startConversation(conversationKey);
-            isNewConversation = true;
-          } else {
-            updateConversationActivity(conversationKey);
-          }
+          if (!isConversationActive(conversationKey)) { startConversation(conversationKey); isNewConversation = true; }
+          else updateConversationActivity(conversationKey);
           shouldRespond = true;
           console.log(`💬 Private message from ${senderId}`);
         }
 
-        if (!shouldRespond || !text) return;
-        console.log(`🤖 Processing message: "${text}" ${isNewConversation ? '(New)' : '(Continuing)'}`);
-        const aiReply = await getAIResponse(userId, msg);
+        if (!shouldRespond) return;
+
+        // Important: pass full msg if no text (to capture locationMessage)
+        const inputForAI = text || msg;
+        console.log(`🤖 Processing: "${text || '[non-text message]'}" ${isNewConversation ? '(New)' : '(Cont.)'}`);
+        const aiReply = await getAIResponse(userId, inputForAI);
 
         if (isGroup) {
           if (sendPrivately) {
             await sock.sendMessage(senderId, { text: aiReply });
-            console.log(`📤 Sent private reply to ${senderId}`);
+            console.log(`📤 Private reply to ${senderId}`);
           } else {
             await sock.sendMessage(groupId, { text: aiReply });
-            console.log(`📤 Sent group reply to ${groupId}`);
+            console.log(`📤 Group reply to ${groupId}`);
           }
         } else {
           await sock.sendMessage(senderId, { text: aiReply });
-          console.log(`📤 Sent private reply to ${senderId}`);
+          console.log(`📤 Private reply to ${senderId}`);
         }
       } catch (err) {
         console.error('messages.upsert error:', err);
       }
     });
 
-    // Keep alive + presence + cleanup
+    /* === Keep alive / presence / cleanup === */
     setInterval(() => { try { if (sock?.ws && sock.ws.readyState === 1) sock.ws.ping(); } catch {} }, 30000);
     setInterval(async () => { try { if (sock?.user) await sock.sendPresenceUpdate('available'); } catch {} }, 60000);
     setInterval(() => {
@@ -248,7 +249,7 @@ async function startBot() {
       for (const [key, conv] of activeConversations.entries()) {
         if (now - conv.lastActivity >= CONVERSATION_TIMEOUT) {
           activeConversations.delete(key);
-          console.log(`🧹 Cleaned expired conversation: ${key}`);
+          console.log(`🧹 Expired conversation: ${key}`);
         }
       }
     }, 5 * 60 * 1000);
@@ -256,10 +257,7 @@ async function startBot() {
     console.log('Bot started.');
   } catch (err) {
     console.error('startBot error:', err);
-    setTimeout(() => {
-      isStarting = false;
-      if (!shouldStop) startBot();
-    }, 2000);
+    setTimeout(() => { isStarting = false; if (!shouldStop) startBot(); }, 2000);
   } finally {
     isStarting = false;
   }
@@ -267,11 +265,12 @@ async function startBot() {
 
 startBot();
 
-// reminders
+/* === Reminders === */
 startReminderScheduler(async (userId, text) => {
   await sock.sendMessage(userId, { text });
 });
 
+/* === Graceful shutdown === */
 process.on('SIGINT', async () => {
   console.log('\n👋 Shutting down...');
   shouldStop = true;
