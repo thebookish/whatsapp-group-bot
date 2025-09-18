@@ -351,10 +351,42 @@ async function generateAIResponse(profile, studentMessage, conversationHistory =
 async function getAIResponse(userId, rawMessage) {
   try {
     const uid = validateUserId(userId);
-    let messageText = typeof rawMessage === "object" ? extractTextFromMessage(rawMessage) : rawMessage;
-    if (!messageText) return "Text only please 🙂";
-    messageText = validateMessage(messageText);
-    const lowerMsg = messageText.toLowerCase();
+let messageText =
+  typeof rawMessage === "object"
+    ? extractTextFromMessage(rawMessage)
+    : rawMessage;
+
+// ✅ Special-case: allow location messages even without text
+const locMsg = rawMessage?.message?.locationMessage;
+if (!messageText) {
+  if (locMsg && typeof locMsg.degreesLatitude === "number" && typeof locMsg.degreesLongitude === "number") {
+    try {
+        await upsertUserLocation(uid, {
+          lat: locMsg.degreesLatitude,
+          lon: locMsg.degreesLongitude,
+          city: null,
+          discoverable: true,
+          radiusKm: 10
+        });
+
+        // Save conversation in DB for tracking
+        const confirmReply = "📍 Got your location. You’re now discoverable to nearby students!";
+        try { await saveConversation(uid, "[shared location]", confirmReply); } catch (_) {}
+
+        return confirmReply;
+      } catch (e) {
+        console.error("upsertUserLocation error:", e);
+        return "❌ Failed to save your location. Please try again.";
+      }
+  } else {
+    return "Text only please 🙂";
+  }
+}
+
+if (messageText) {
+  messageText = validateMessage(messageText);
+}
+const lowerMsg = messageText ? messageText.toLowerCase() : "";
 
     const { exists, user } = await checkUserExists(uid);
     let profile;
@@ -379,18 +411,18 @@ async function getAIResponse(userId, rawMessage) {
       activeSessions.set(uid, profile);
     }
 
-    /* ==== Location Capture ==== */
-    const loc = rawMessage?.message?.locationMessage;
-    if (loc) {
-      await upsertUserLocation(uid, {
-        lat: loc.degreesLatitude,
-        lon: loc.degreesLongitude,
-        city: null,
-        discoverable: true,
-        radiusKm: 10,
-      });
-      return "📍 Got your location. You’re now discoverable to nearby students.";
-    }
+    // /* ==== Location Capture ==== */
+    // const loc = rawMessage?.message?.locationMessage;
+    // if (loc) {
+    //   await upsertUserLocation(uid, {
+    //     lat: loc.degreesLatitude,
+    //     lon: loc.degreesLongitude,
+    //     city: null,
+    //     discoverable: true,
+    //     radiusKm: 10,
+    //   });
+    //   return "📍 Got your location. You’re now discoverable to nearby students.";
+    // }
 
     /* ==== Accept code ==== */
     const acceptHit = messageText.match(ACCEPT_PAT);
