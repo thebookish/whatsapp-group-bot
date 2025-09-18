@@ -51,18 +51,19 @@ function extractTextFromMessage(message) {
   if (!message) return null;
   if (typeof message === "string") return message.trim();
   if (typeof message.conversation === "string") return message.conversation.trim();
+  if (message.message?.conversation) return message.message.conversation.trim();
   if (message.extendedTextMessage?.text) return message.extendedTextMessage.text.trim();
+  if (message.message?.extendedTextMessage?.text) return message.message.extendedTextMessage.text.trim();
   if (message.imageMessage?.caption) return message.imageMessage.caption.trim();
+  if (message.message?.imageMessage?.caption) return message.message.imageMessage.caption.trim();
   if (message.videoMessage?.caption) return message.videoMessage.caption.trim();
-  if (message.buttonsResponseMessage?.selectedButtonId) return String(message.buttonsResponseMessage.selectedButtonId).trim();
-  if (message.listResponseMessage?.singleSelectReply?.selectedRowId) return String(message.listResponseMessage.singleSelectReply.selectedRowId).trim();
+  if (message.message?.videoMessage?.caption) return message.message.videoMessage.caption.trim();
   if (message.text) {
     if (typeof message.text === "string") return message.text.trim();
-    if (message.text.body) return String(message.text.body).trim();
+    if (message.text.body) return message.text.body.trim();
   }
   return null;
 }
-
 
 
 function validateUserId(userId) {
@@ -350,29 +351,43 @@ async function generateAIResponse(profile, studentMessage, conversationHistory =
 async function getAIResponse(userId, rawMessage) {
   try {
     const uid = validateUserId(userId);
+let messageText =
+  typeof rawMessage === "object"
+    ? extractTextFromMessage(rawMessage)
+    : rawMessage;
 
-    // Extract text safely
-    let messageText =
-      typeof rawMessage === "object"
-        ? extractTextFromMessage(rawMessage)
-        : rawMessage;
+// ✅ Special-case: allow location messages even without text
+const locMsg = rawMessage?.message?.locationMessage;
+if (!messageText) {
+  if (locMsg && typeof locMsg.degreesLatitude === "number" && typeof locMsg.degreesLongitude === "number") {
+    try {
+        await upsertUserLocation(uid, {
+          lat: locMsg.degreesLatitude,
+          lon: locMsg.degreesLongitude,
+          city: null,
+          discoverable: true,
+          radiusKm: 10
+        });
 
-    // ✅ Special-case: allow location even without text
-    const locMsg = rawMessage?.message?.locationMessage;
-    if (!messageText) {
-      if (locMsg && typeof locMsg.degreesLatitude === "number" && typeof locMsg.degreesLongitude === "number") {
-        // Location will be processed below
-      } else {
-        return "Text only please 🙂";
+        // Save conversation in DB for tracking
+        const confirmReply = "📍 Got your location. You’re now discoverable to nearby students!";
+        try { await saveConversation(uid, "[shared location]", confirmReply); } catch (_) {}
+
+        return confirmReply;
+      } catch (e) {
+        console.error("upsertUserLocation error:", e);
+        return "❌ Failed to save your location. Please try again.";
       }
-    } else {
-      // only validate if we got a string
-      messageText = validateMessage(messageText);
-    }
+  } else {
+    return "Text only please 🙂";
+  }
+}
 
-    const lowerMsg = messageText ? messageText.toLowerCase() : "";
+if (messageText) {
+  messageText = validateMessage(messageText);
+}
+const lowerMsg = messageText ? messageText.toLowerCase() : "";
 
-    // === Ensure user profile ===
     const { exists, user } = await checkUserExists(uid);
     let profile;
     if (activeSessions.has(uid)) {
@@ -396,76 +411,73 @@ async function getAIResponse(userId, rawMessage) {
       activeSessions.set(uid, profile);
     }
 
-    // === 1) Location capture ===
-    if (locMsg && typeof locMsg.degreesLatitude === "number" && typeof locMsg.degreesLongitude === "number") {
-      try {
-        await upsertUserLocation(uid, {
-          lat: locMsg.degreesLatitude,
-          lon: locMsg.degreesLongitude,
-          city: null,
-          discoverable: true,
-          radiusKm: 10,
-        });
-        return "📍 Got your location. You’re now discoverable to nearby students.";
-      } catch (e) {
-        console.error("upsertUserLocation error:", e);
-        return "⚠️ Could not save your location.";
-      }
-    }
+    // /* ==== Location Capture ==== */
+    // const loc = rawMessage?.message?.locationMessage;
+    // if (loc) {
+    //   await upsertUserLocation(uid, {
+    //     lat: loc.degreesLatitude,
+    //     lon: loc.degreesLongitude,
+    //     city: null,
+    //     discoverable: true,
+    //     radiusKm: 10,
+    //   });
+    //   return "📍 Got your location. You’re now discoverable to nearby students.";
+    // }
 
-    // === 2) Reminders ===
-    if (messageText && /^(remind me|add reminder)\b/i.test(messageText)) {
-      return await handleReminder(uid, messageText);
-    }
+    /* ==== Accept code ==== */
+  /* ==== Accept code ==== */
+if (typeof messageText === "string") {
+  const acceptHit = messageText.match(ACCEPT_PAT);
+  if (acceptHit) {
+    return await handleAcceptCode(uid, acceptHit[1]);
+  }
+}
 
-    // === 3) Accept code (from button or text) ===
-    if (messageText && /^accept\s+(\d{4,6})$/i.test(messageText)) {
-      const code = messageText.match(/^accept\s+(\d{4,6})$/i)[1];
-      return await handleAcceptCode(uid, code);
-    }
-    if (messageText && messageText.startsWith("ACCEPT_")) {
-      const code = messageText.replace("ACCEPT_", "").trim();
-      return await handleAcceptCode(uid, code);
-    }
-
-    // === 4) Connect me intent ===
-    if (messageText && /\b(connect|find|match)\b.*\b(student|buddy|peer|friend)\b.*\b(near|nearby|around|close)\b/i.test(messageText)) {
+    /* ==== Connect me ==== */
+    if (CONNECT_PAT.test(messageText)) {
       const topicMatch = messageText.match(/\b(?:about|for)\s+(.{3,60})$/i);
       const topic = topicMatch ? topicMatch[1].trim() : "";
       return await handleConnectIntent({ requesterId: uid, topic, radiusKm: 10 });
     }
+// ==== Discoverability toggles ====
+if (/make me discoverable/i.test(messageText)) {
+  const { error } = await supabase
+    .from("users")
+    .update({ discoverable: true })
+    .eq("user_id", uid);
+  return error
+    ? "Could not update discoverability."
+    : "✅ You’re now discoverable to nearby students.";
+}
 
-    // === 5) Discoverability toggles ===
-    if (messageText && /make me discoverable/i.test(messageText)) {
-      const { error } = await supabase.from("users").update({ discoverable: true }).eq("user_id", uid);
-      return error ? "Could not update discoverability." : "✅ You’re now discoverable to nearby students.";
-    }
-    if (messageText && /stop discoverable|hide me/i.test(messageText)) {
-      const { error } = await supabase.from("users").update({ discoverable: false }).eq("user_id", uid);
-      return error ? "Could not update discoverability." : "👻 Got it. You’re no longer discoverable.";
+if (/stop discoverable|hide me|make me invisible/i.test(messageText)) {
+  const { error } = await supabase
+    .from("users")
+    .update({ discoverable: false })
+    .eq("user_id", uid);
+  return error
+    ? "Could not update discoverability."
+    : "👌 Got it. You’re no longer discoverable.";
+}
+
+    /* ==== Reminder ==== */
+    if (/^(remind me|add reminder)\b/i.test(messageText)) {
+      return await handleReminder(uid, messageText);
     }
 
-    // === 6) Pagination ===
-    if (
-      messageText &&
-      MORE_PATTERNS.test(lowerMsg) &&
-      Array.isArray(profile.lastRows) &&
-      profile.lastRows.length
-    ) {
+    /* ==== More pagination ==== */
+    if (MORE_PATTERNS.test(lowerMsg) && Array.isArray(profile.lastRows) && profile.lastRows.length) {
       const start = profile.lastOffset || 0;
       const reply = formatCourseSlice(profile.lastRows, start, 5);
       profile.lastOffset = Math.min(start + 5, profile.lastRows.length);
       try { await saveConversation(uid, messageText, reply); } catch (_) {}
-      profile.conversationHistory.push({ message: messageText, response: reply, timestamp: new Date() });
-      if (profile.conversationHistory.length > 20) profile.conversationHistory.shift();
-      if (exists) { try { await updateUserInDB(uid, {}); } catch (_) {} }
       return reply;
     } else {
       profile.lastRows = null;
       profile.lastOffset = 0;
     }
 
-    // === 7) Onboarding ===
+    /* ==== Onboarding ==== */
     if (profile.onboardingStep !== ONBOARDING_STEPS.COMPLETE) {
       switch (profile.onboardingStep) {
         case ONBOARDING_STEPS.NAME: {
@@ -490,80 +502,45 @@ async function getAIResponse(userId, rawMessage) {
           profile.country = messageText;
           profile.onboardingStep = ONBOARDING_STEPS.COMPLETE;
           try { await createUserInDB(uid, profile); }
-          catch (e) { try { await updateUserInDB(uid, { name: profile.name, interests: profile.interests, goals: profile.goals, country: profile.country }); } catch (_) {} }
+          catch { try { await updateUserInDB(uid, profile); } catch (_) {} }
           return `Profile saved ✅ Ask me anything about courses, unis, or apps.`;
         }
       }
     }
 
-    // === 8) Greetings ===
-    if (messageText && GREETING_PATTERNS.test(lowerMsg)) {
+    /* ==== Greeting ==== */
+    if (GREETING_PATTERNS.test(lowerMsg)) {
       return `Hey ${profile.name || "there"} 👋 How can I help?`;
     }
 
-    // === 9) Accommodation ===
-    if (messageText && ACCO_PATTERNS.test(lowerMsg)) {
+    /* ==== Accommodation ==== */
+    if (ACCO_PATTERNS.test(lowerMsg)) {
       const prefs = parseAccommodationQuery(messageText);
       if (!prefs.place_name) return `Tell me the city/area + budget, e.g. "1 bed under £900 in Manchester".`;
       const { listings } = await searchUKAccommodation(prefs);
-      const reply = formatAccommodationReply(listings);
-      try { await saveConversation(uid, messageText, reply); } catch (_) {}
-      profile.conversationHistory.push({ message: messageText, response: reply, timestamp: new Date() });
-      if (profile.conversationHistory.length > 20) profile.conversationHistory.shift();
-      if (exists) { try { await updateUserInDB(uid, {}); } catch (_) {} }
-      return reply;
+      return formatAccommodationReply(listings);
     }
 
-    // === 10) Dataset / RAG ===
+    /* ==== Dataset ==== */
     const result = await queryDataset(messageText, { max: 200 });
-
     if (result && result.intent === "GENERAL") {
-      const reply = await generateAIResponse(profile, messageText, profile.conversationHistory, "");
-      try { await saveConversation(uid, messageText, reply); } catch (_) {}
-      profile.conversationHistory.push({ message: messageText, response: reply, timestamp: new Date() });
-      if (profile.conversationHistory.length > 20) profile.conversationHistory.shift();
-      if (exists) { try { await updateUserInDB(uid, {}); } catch (_) {} }
-      return reply;
+      return await generateAIResponse(profile, messageText, profile.conversationHistory, "");
     }
-
     if (result && Array.isArray(result.rows) && result.rows.length) {
-      const head = result.text || "";
-      const reply = formatCourseSlice(result.rows, 0, 5, head);
       profile.lastRows = result.rows;
-      profile.lastOffset = Math.min(5, profile.lastRows.length);
-      try { await saveConversation(uid, messageText, reply); } catch (_) {}
-      profile.conversationHistory.push({ message: messageText, response: reply, timestamp: new Date() });
-      if (profile.conversationHistory.length > 20) profile.conversationHistory.shift();
-      if (exists) { try { await updateUserInDB(uid, {}); } catch (_) {} }
-      return reply;
+      profile.lastOffset = Math.min(5, result.rows.length);
+      return formatCourseSlice(result.rows, 0, 5, result.text || "");
     }
-
     if (result && (!result.rows || !result.rows.length)) {
-      const reply = await generateAIResponse(profile, messageText, profile.conversationHistory, "");
-      try { await saveConversation(uid, messageText, reply); } catch (_) {}
-      profile.conversationHistory.push({ message: messageText, response: reply, timestamp: new Date() });
-      if (profile.conversationHistory.length > 20) profile.conversationHistory.shift();
-      if (exists) { try { await updateUserInDB(uid, {}); } catch (_) {} }
-      return reply;
+      return await generateAIResponse(profile, messageText, profile.conversationHistory, "");
     }
 
-    // === 11) Fallback ===
-    const genericReply = `I’m not sure yet. Tell me the subject, level (UG/PG), preferred campus/city, and start month—I'll suggest options.`;
-    try { await saveConversation(uid, messageText, genericReply); } catch (_) {}
-    profile.conversationHistory.push({ message: messageText, response: genericReply, timestamp: new Date() });
-    if (profile.conversationHistory.length > 20) profile.conversationHistory.shift();
-    if (exists) { try { await updateUserInDB(uid, {}); } catch (_) {} }
-    return genericReply;
-
+    return `I’m not sure yet. Tell me the subject, level (UG/PG), preferred campus/city, and start month—I'll suggest options.`;
   } catch (error) {
     console.error("getAIResponse error:", error.message);
-    if (error.message.includes("Invalid userId")) return "Invalid user ID.";
-    if (error.message.includes("Empty message")) return "Please send a text 🙂";
-    if (error.message.includes("Message too long")) return "Too long—keep it under 1000 chars.";
     return "Sorry, something went wrong.";
   }
 }
-
 
 /* ============================
    Exports
