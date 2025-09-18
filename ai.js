@@ -1,280 +1,502 @@
-const express = require('express');
-const path = require('path');
+const axios = require("axios");
+const { supabase, OPENROUTER_API_KEY, NESTORIA_ENDPOINT } = require("./config");
+const { normBase, queryDataset } = require("./rag");
+const { addReminder } = require("./reminder");
+const chrono = require("chrono-node");
 const {
-  default: makeWASocket,
-  DisconnectReason,
-  useMultiFileAuthState
-} = require('@whiskeysockets/baileys');
-const { getAIResponse } = require('./ai');
-const { initMatch } = require('./match');
-const { WebSocketServer } = require('ws');
-const { startReminderScheduler } = require('./reminder');
-
-const app = express();
-const PORT = 3000;
-const AUTH_DIR = 'auth_info_baileys';
-const KEEP_ALIVE_MS = 10000;
-const TRIGGER_KEYWORD = 'heybot';
-const CONVERSATION_TIMEOUT = 30 * 60 * 1000;
-
-app.use(express.static(path.join(__dirname, 'public')));
-app.get('/health', (req, res) => res.json({ ok: true }));
-
-const server = app.listen(PORT, () => {
-  console.log(`🚀 Server running at http://localhost:${PORT}`);
-});
-
-const wss = new WebSocketServer({ server });
-function broadcast(data) {
-  const str = JSON.stringify(data);
-  wss.clients.forEach(client => {
-    if (client.readyState === 1) client.send(str);
-  });
-}
-
-let sock = null;
-let saveCreds = null;
-let isStarting = false;
-let shouldStop = false;
-let botJid = null;
-let activeConversations = new Map();
+  handleConnectIntent,
+  handleAcceptCode,
+  upsertUserLocation,
+} = require("./match");
 
 /* ============================
-   Message utils
+   Onboarding & App State
 ============================= */
+const ONBOARDING_STEPS = {
+  NAME: 1,
+  INTERESTS: 2,
+  GOALS: 3,
+  COUNTRY: 4,
+  COMPLETE: 0,
+};
+const GREETING_PATTERNS = /\b(hello|hi|hey)\b/i;
+const ACCO_PATTERNS =
+  /\b(accommodation|accomodation|rent|room|flat|house|hall|student hall|dorm|hostel)\b/i;
+const MORE_PATTERNS = /^(more|next|show me more|see more)\b/i;
+
+// new patterns
+const CONNECT_PAT = /\b(connect|find|match)\b.*\b(student|buddy|peer|friend)\b.*\b(near|nearby|around|close)\b/i;
+const ACCEPT_PAT = /^accept\s+(\d{4,6})$/i;
+
+const activeSessions = new Map();
+
+/* ============================
+   Helpers
+============================= */
+function createUserProfile() {
+  return {
+    name: "",
+    interests: "",
+    goals: "",
+    country: "",
+    onboardingStep: ONBOARDING_STEPS.NAME,
+    lastInteraction: new Date(),
+    conversationHistory: [],
+    lastRows: null,
+    lastOffset: 0,
+  };
+}
+
 function extractTextFromMessage(message) {
-  if (!message) return '';
-  if (typeof message.conversation === 'string') return message.conversation;
-  if (typeof message.extendedTextMessage?.text === 'string') return message.extendedTextMessage.text;
-  if (typeof message.imageMessage?.caption === 'string') return message.imageMessage.caption;
-  if (typeof message.videoMessage?.caption === 'string') return message.videoMessage.caption;
-  if (typeof message.buttonsResponseMessage?.selectedButtonId === 'string') return message.buttonsResponseMessage.selectedButtonId;
-  if (typeof message.listResponseMessage?.singleSelectReply?.selectedRowId === 'string') return message.listResponseMessage.singleSelectReply.selectedRowId;
-  if (message?.text?.body) return message.text.body;
-  return '';
-}
-
-function isBotMentioned(message, botJid) {
-  if (!message || !botJid) return false;
-  if (message.extendedTextMessage?.contextInfo?.mentionedJid?.includes(botJid)) return true;
-  if (message.contextInfo?.mentionedJid?.includes(botJid)) return true;
-  return false;
-}
-
-function isBotRepliedTo(message, botJid) {
-  if (!message || !botJid) return false;
-  const quotedMsg = message.extendedTextMessage?.contextInfo?.quotedMessage;
-  const stanzaId = message.extendedTextMessage?.contextInfo?.stanzaId;
-  const participant = message.extendedTextMessage?.contextInfo?.participant;
-  if (participant === botJid || (quotedMsg && stanzaId)) return true;
-  return false;
-}
-
-/* ============================
-   Conversation tracking
-============================= */
-function isConversationActive(conversationKey) {
-  const conversation = activeConversations.get(conversationKey);
-  if (!conversation) return false;
-  const now = Date.now();
-  const isActive = now - conversation.lastActivity < CONVERSATION_TIMEOUT;
-  if (!isActive) {
-    activeConversations.delete(conversationKey);
-    console.log(`⏰ Conversation timeout: ${conversationKey}`);
+  if (!message) return null;
+  if (typeof message === "string") return message.trim();
+  if (typeof message.conversation === "string") return message.conversation.trim();
+  if (message.extendedTextMessage?.text) return message.extendedTextMessage.text.trim();
+  if (message.imageMessage?.caption) return message.imageMessage.caption.trim();
+  if (message.videoMessage?.caption) return message.videoMessage.caption.trim();
+  if (message.text) {
+    if (typeof message.text === "string") return message.text.trim();
+    if (message.text.body) return message.text.body.trim();
   }
-  return isActive;
+  return null;
 }
-function startConversation(conversationKey) {
-  activeConversations.set(conversationKey, { startTime: Date.now(), lastActivity: Date.now() });
-  console.log(`🆕 Started conversation: ${conversationKey}`);
+
+function validateUserId(userId) {
+  if (!userId || typeof userId !== "string") throw new Error("Invalid userId");
+  return userId;
 }
-function updateConversationActivity(conversationKey) {
-  const conversation = activeConversations.get(conversationKey);
-  if (conversation) conversation.lastActivity = Date.now();
+function validateMessage(msg) {
+  if (!msg || typeof msg !== "string" || !msg.trim()) throw new Error("Empty message");
+  if (msg.length > 1000) throw new Error("Message too long");
+  return msg.trim();
+}
+function isGreetingOnly(text) {
+  const cleaned = text.toLowerCase().replace(/[^a-z\s']/g, " ").trim();
+  if (!cleaned) return false;
+  const words = cleaned.split(/\s+/).filter(Boolean);
+  return words.length > 0 && words.every((w) => /(hello|hi|hey|start|begin)/.test(w));
+}
+function extractNameFromText(text) {
+  const p1 = /(my name is|i am|i'm|this is)\s+([^\n,.;!?]+)/i.exec(text);
+  if (p1 && p1[2]) return p1[2].trim();
+  const p2 = /^(hello|hi|hey)[\s,!:;-]*(.*)$/i.exec(text.trim());
+  if (p2 && p2[2]) {
+    const rest = p2[2].trim();
+    if (rest) return rest;
+  }
+  if (!isGreetingOnly(text) && text.trim().length <= 60) return text.trim();
+  return "";
 }
 
 /* ============================
-   Bot start
+   Supabase DB Helpers
 ============================= */
-async function startBot() {
-  if (isStarting) return;
-  isStarting = true;
-
+async function checkUserExists(userId) {
   try {
-    const stateRes = await useMultiFileAuthState(AUTH_DIR);
-    const { state, saveCreds: _saveCreds } = stateRes;
-    saveCreds = _saveCreds;
+    const { data, error } = await supabase
+      .from("users")
+      .select("*")
+      .eq("user_id", userId)
+      .single();
+    if (error && error.code !== "PGRST116") throw error;
+    return { exists: !!data, user: data || null };
+  } catch (error) {
+    console.error("Error checking user existence:", error);
+    return { exists: false, user: null };
+  }
+}
+async function createUserInDB(userId, profile) {
+  try {
+    const { data, error } = await supabase
+      .from("users")
+      .insert([
+        {
+          user_id: userId,
+          name: profile.name,
+          interests: profile.interests,
+          goals: profile.goals,
+          country: profile.country,
+          created_at: new Date(),
+          last_interaction: new Date(),
+        },
+      ])
+      .select()
+      .single();
+    if (error) throw error;
+    return data;
+  } catch (error) {
+    console.error("Error creating user in DB:", error);
+    throw error;
+  }
+}
+async function updateUserInDB(userId, updates) {
+  try {
+    const { data, error } = await supabase
+      .from("users")
+      .update({
+        ...updates,
+        last_interaction: new Date(),
+      })
+      .eq("user_id", userId)
+      .select()
+      .single();
+    if (error) throw error;
+    return data;
+  } catch (error) {
+    console.error("Error updating user in DB:", error);
+    throw error;
+  }
+}
+async function getConversationHistory(userId) {
+  try {
+    const { data, error } = await supabase
+      .from("conversations")
+      .select("*")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: true })
+      .limit(20);
+    if (error) throw error;
+    return data || [];
+  } catch (error) {
+    console.error("Error getting conversation history:", error);
+    return [];
+  }
+}
+async function saveConversation(userId, message, response) {
+  try {
+    const { error } = await supabase.from("conversations").insert([
+      {
+        user_id: userId,
+        message,
+        response,
+        created_at: new Date(),
+      },
+    ]);
+    if (error) throw error;
+  } catch (error) {
+    console.error("Error saving conversation:", error);
+  }
+}
 
-    if (sock) {
-      try {
-        if (sock.ws && sock.ws.readyState === 1) await sock.end();
-      } catch {}
-      sock = null;
+/* ============================
+   Reminder Handling
+============================= */
+async function handleReminder(uid, messageText) {
+  const parsed = chrono.parse(messageText);
+  let date = null;
+  let task = null;
+  if (parsed.length > 0) {
+    date = parsed[0].start.date();
+    const textTime = parsed[0].text;
+    task = messageText
+      .replace(/^(remind me|add reminder)\b/i, "")
+      .replace(textTime, "")
+      .trim();
+  }
+  if (!date) {
+    return "I couldn’t detect a valid time. Try: 'remind me tomorrow at 9am to check mail'.";
+  }
+  if (!task) {
+    return "What should I remind you about?";
+  }
+  await addReminder(uid, task, date);
+  return `✅ Got it! I’ll remind you to *${task}* at ${date.toLocaleString()}.`;
+}
+
+/* ============================
+   Accommodation Helpers (UK)
+============================= */
+function parseAccommodationQuery(text) {
+  const q = normBase(text);
+  const priceMatch =
+    q.match(/\b(?:under|<=?|max|up to)\s*[£$]?\s*(\d{2,5})\b/) ||
+    q.match(/\b[£$]\s*(\d{2,5})\b/);
+  const price_max = priceMatch ? parseInt(priceMatch[1], 10) : undefined;
+
+  let bedrooms;
+  const bedMatch = q.match(/\b(\d)\s*(?:bed|beds|bedroom|bedrooms)\b/);
+  if (bedMatch) bedrooms = parseInt(bedMatch[1], 10);
+  else if (/\bstudio\b/.test(q)) bedrooms = 0;
+
+  let place_name;
+  const locMatch = q.match(/\b(?:in|at|near|around)\s+([a-z\s\-&']{2,})$/i);
+  if (locMatch) {
+    place_name = locMatch[1].trim();
+  } else {
+    const cap = (text.match(/[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*/g) || [])[0];
+    if (cap) place_name = cap.trim();
+  }
+  return { place_name, price_max, bedrooms };
+}
+
+async function searchUKAccommodation({
+  place_name,
+  price_max,
+  bedrooms,
+  page = 1,
+  num = 8,
+}) {
+  if (!place_name) return { listings: [], meta: { message: "No location provided" } };
+  const params = {
+    encoding: "json",
+    action: "search_listings",
+    country: "uk",
+    listing_type: "rent",
+    page,
+    number_of_results: Math.max(3, Math.min(num, 20)),
+    place_name,
+  };
+  if (price_max) params.price_max = price_max;
+  if (typeof bedrooms === "number") {
+    if (bedrooms === 0) {
+      params.bedroom_max = 0;
+    } else {
+      params.bedroom_min = bedrooms;
+      params.bedroom_max = bedrooms;
+    }
+  }
+  try {
+    const r = await axios.get(NESTORIA_ENDPOINT, { params, timeout: 15000 });
+    const body = r.data && r.data.response ? r.data.response : {};
+    const listings = (body.listings || []).map((x) => ({
+      title:
+        x.title ||
+        `${x.bedroom_number || ""} bed ${x.property_type || "property"}`.trim(),
+      price: x.price,
+      price_formatted: x.price_formatted || (x.price ? `£${x.price} pcm` : ""),
+      bedrooms: x.bedroom_number,
+      bathrooms: x.bathroom_number,
+      property_type: x.property_type,
+      address: x.formatted_address || x.summary || "",
+      url: x.lister_url || x.url || "",
+      thumbnail: x.thumb_url || x.img_url || "",
+      latitude: x.latitude,
+      longitude: x.longitude,
+    }));
+    return { listings, meta: { total: body.total_results, page: body.page, pages: body.total_pages } };
+  } catch (e) {
+    console.error("Accommodation API error:", e?.response?.data || e.message);
+    return { listings: [], meta: { error: true, message: "Failed to fetch listings" } };
+  }
+}
+function formatAccommodationReply(listings) {
+  if (!listings.length)
+    return "Couldn’t find live listings for that—try a nearby area or raise budget a bit?";
+  const top = listings.slice(0, 5);
+  return top.map(
+    (l) =>
+      `• ${l.title} – ${l.price_formatted}${l.bedrooms != null ? `, ${l.bedrooms} bed` : ""}\n  ${l.address}${l.url ? `\n  ${l.url}` : ""}`
+  ).join("\n");
+}
+
+/* ============================
+   Course result formatting
+============================= */
+function formatCourseSlice(rows, start = 0, size = 5, head = "") {
+  const slice = rows.slice(start, start + size);
+  if (!slice.length) return "No more results.";
+  const lines = slice.map((r) => {
+    const title = r.raw?.course_title || r.course_title || "Course";
+    const qual = r.raw?.qualification || r.qualification || "";
+    const campus = r.raw?.campus || r.campus || "";
+    const startDate = r.raw?.start_date_raw || r.start_date || "";
+    const app = r.raw?.application_code || r.application_code || "";
+    let out = `*${title}*`;
+    if (qual) out += `\n  Qualification: ${qual}`;
+    if (campus) out += `\n  Campus: ${campus}`;
+    if (startDate) out += `\n  Start: ${startDate}`;
+    if (app) out += `\n  Code: ${app}`;
+    return out;
+  });
+  return head ? `${head}\n\n${lines.join("\n\n")}\n\nReply "more" to see more options.` : `${lines.join("\n\n")}\n\nReply "more" to see more options.`;
+}
+
+/* ============================
+   LLM
+============================= */
+async function generateAIResponse(profile, studentMessage, conversationHistory = [], ragContext = "") {
+  const historyContext = conversationHistory.map((h) => `User: ${h.message}\nAssistant: ${h.response}`).join("\n");
+  const systemPrompt = `You are a helpful Student Assistant. Keep answers short and natural.\nIf RAG context is provided, rely on it for factual course details.\nIf it's missing or irrelevant, answer generally and helpfully.`;
+  const ragBlock = ragContext ? `\nRAG Context:\n${ragContext}\n` : "";
+  const userPrompt = `Student Info:\n- Name: ${profile.name}\n- Interests: ${profile.interests}\n- Goals: ${profile.goals}\n- Country: ${profile.country}\n\nRecent Chat History:\n${historyContext}\n\nStudent's Latest Question:\n"${studentMessage}"${ragBlock}`;
+  try {
+    const res = await axios.post(
+      "https://openrouter.ai/api/v1/chat/completions",
+      {
+        model: "mistralai/mistral-7b-instruct",
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+        max_tokens: 250,
+        temperature: 0.4,
+      },
+      { headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}`, "Content-Type": "application/json" }, timeout: 15000 }
+    );
+    return res.data?.choices?.[0]?.message?.content || "Sorry, I couldn't process that.";
+  } catch (error) {
+    console.error("AI API error:", error?.response?.data || error.message);
+    return "Sorry, I couldn't process that right now.";
+  }
+}
+
+/* ============================
+   Main entry
+============================= */
+async function getAIResponse(userId, rawMessage) {
+  try {
+    const uid = validateUserId(userId);
+    let messageText = typeof rawMessage === "object" ? extractTextFromMessage(rawMessage) : rawMessage;
+    if (!messageText) return "Text only please 🙂";
+    messageText = validateMessage(messageText);
+    const lowerMsg = messageText.toLowerCase();
+
+    const { exists, user } = await checkUserExists(uid);
+    let profile;
+    if (activeSessions.has(uid)) {
+      profile = activeSessions.get(uid);
+    } else if (exists && user) {
+      profile = {
+        name: user.name || "",
+        interests: user.interests || "",
+        goals: user.goals || "",
+        country: user.country || "",
+        onboardingStep: ONBOARDING_STEPS.COMPLETE,
+        lastInteraction: new Date(),
+        conversationHistory: await getConversationHistory(uid),
+        lastRows: null,
+        lastOffset: 0,
+      };
+      activeSessions.set(uid, profile);
+      try { await updateUserInDB(uid, {}); } catch (_) {}
+    } else {
+      profile = createUserProfile();
+      activeSessions.set(uid, profile);
     }
 
-    sock = makeWASocket({
-      auth: state,
-      printQRInTerminal: false,
-      keepAliveIntervalMs: KEEP_ALIVE_MS,
-    });
+    /* ==== Location Capture ==== */
+    const loc = rawMessage?.message?.locationMessage;
+    if (loc) {
+      await upsertUserLocation(uid, {
+        lat: loc.degreesLatitude,
+        lon: loc.degreesLongitude,
+        city: null,
+        discoverable: true,
+        radiusKm: 10,
+      });
+      return "📍 Got your location. You’re now discoverable to nearby students.";
+    }
 
-    /* === init match system with send + createGroup === */
-    initMatch({
-      send: async (jid, text) => {
-        await sock.sendMessage(jid, { text });
-      },
-      createGroup: async (subject, jids) => {
-        return await sock.groupCreate(subject, jids);
-      },
-    });
+    /* ==== Accept code ==== */
+    const acceptHit = messageText.match(ACCEPT_PAT);
+    if (acceptHit) {
+      return await handleAcceptCode(uid, acceptHit[1]);
+    }
 
-    sock.ev.on('connection.update', (update) => {
-      const { connection, lastDisconnect, qr } = update;
-      if (qr) {
-        broadcast({ type: 'qr', qr });
-        console.log('📷 New QR generated.');
-      }
-      if (connection === 'open') {
-        console.log('✅ WhatsApp connected');
-        botJid = sock.user.id;
-        console.log('🤖 Bot JID:', botJid);
-        broadcast({ type: 'status', status: 'connected' });
-      } else if (connection === 'close') {
-        const reason = lastDisconnect?.error?.output?.statusCode;
-        const isLoggedOut = reason === DisconnectReason.loggedOut;
-        console.log('🔌 Connection closed.', reason, 'loggedOut:', isLoggedOut);
-        broadcast({ type: 'status', status: 'disconnected', reason });
-        if (!isLoggedOut) {
-          setTimeout(() => {
-            isStarting = false;
-            if (!shouldStop) startBot();
-          }, 2000);
-        } else {
-          console.log('❌ Logged out — restart with new QR.');
+    /* ==== Connect me ==== */
+    if (CONNECT_PAT.test(messageText)) {
+      const topicMatch = messageText.match(/\b(?:about|for)\s+(.{3,60})$/i);
+      const topic = topicMatch ? topicMatch[1].trim() : "";
+      return await handleConnectIntent({ requesterId: uid, topic, radiusKm: 10 });
+    }
+
+    /* ==== Reminder ==== */
+    if (/^(remind me|add reminder)\b/i.test(messageText)) {
+      return await handleReminder(uid, messageText);
+    }
+
+    /* ==== More pagination ==== */
+    if (MORE_PATTERNS.test(lowerMsg) && Array.isArray(profile.lastRows) && profile.lastRows.length) {
+      const start = profile.lastOffset || 0;
+      const reply = formatCourseSlice(profile.lastRows, start, 5);
+      profile.lastOffset = Math.min(start + 5, profile.lastRows.length);
+      try { await saveConversation(uid, messageText, reply); } catch (_) {}
+      return reply;
+    } else {
+      profile.lastRows = null;
+      profile.lastOffset = 0;
+    }
+
+    /* ==== Onboarding ==== */
+    if (profile.onboardingStep !== ONBOARDING_STEPS.COMPLETE) {
+      switch (profile.onboardingStep) {
+        case ONBOARDING_STEPS.NAME: {
+          if (isGreetingOnly(messageText)) return `Hey! I’m your study buddy. What’s your name?`;
+          const name = extractNameFromText(messageText);
+          if (!name) return `All good—tell me your name (e.g., "I'm Nabil Hasan").`;
+          profile.name = name;
+          profile.onboardingStep = ONBOARDING_STEPS.INTERESTS;
+          return `Nice to meet you, ${profile.name}! What subjects/fields are you into?`;
         }
-      } else if (connection === 'connecting') {
-        console.log('🔄 WhatsApp connecting...');
-        broadcast({ type: 'status', status: 'connecting' });
-      }
-    });
-
-    sock.ev.on('creds.update', saveCreds);
-
-    // Handle messages
-    sock.ev.on('messages.upsert', async ({ messages }) => {
-      try {
-        if (!messages?.[0] || messages[0].key.fromMe) return;
-        const msg = messages[0];
-        const remoteJid = msg.key.remoteJid || '';
-        const isGroup = remoteJid.endsWith('@g.us');
-        const groupId = isGroup ? remoteJid : null;
-        const participantId = msg.key.participant || remoteJid;
-        const senderId = isGroup ? participantId : remoteJid;
-        const userId = isGroup ? participantId : remoteJid;
-
-        const conversationKey = isGroup ? `${remoteJid}_${participantId}` : remoteJid;
-
-        let text = extractTextFromMessage(msg.message);
-        if (!text?.trim()) return;
-        text = text.trim();
-
-        let shouldRespond = false;
-        let sendPrivately = false;
-        let isNewConversation = false;
-
-        if (isGroup) {
-          const conversationActive = isConversationActive(conversationKey);
-          const startsWithTrigger = text.toLowerCase().startsWith(TRIGGER_KEYWORD.toLowerCase());
-
-          if (startsWithTrigger) {
-            if (!conversationActive) {
-              startConversation(conversationKey);
-              isNewConversation = true;
-            }
-            shouldRespond = true;
-            text = text.slice(TRIGGER_KEYWORD.length).trim();
-            console.log(`🎯 Trigger word used in group ${groupId} by ${participantId}`);
-          } else if (conversationActive) {
-            const isMentioned = isBotMentioned(msg.message, botJid);
-            const isRepliedTo = isBotRepliedTo(msg.message, botJid);
-            if (isMentioned || isRepliedTo) {
-              shouldRespond = true;
-              updateConversationActivity(conversationKey);
-              console.log(`🎯 Bot ${isMentioned ? 'mentioned' : 'replied to'} in active conversation ${conversationKey}`);
-              if (isMentioned) text = text.replace(/@\d+/g, '').trim();
-            }
-          }
-          if (shouldRespond && /reply\s+me\s+privately|dm\s+me|private\s+reply/i.test(text)) {
-            sendPrivately = true;
-            text = text.replace(/reply\s+me\s+privately|dm\s+me|private\s+reply/gi, '').trim();
-          }
-        } else {
-          if (!isConversationActive(conversationKey)) {
-            startConversation(conversationKey);
-            isNewConversation = true;
-          } else {
-            updateConversationActivity(conversationKey);
-          }
-          shouldRespond = true;
-          console.log(`💬 Private message from ${senderId}`);
+        case ONBOARDING_STEPS.INTERESTS: {
+          profile.interests = messageText;
+          profile.onboardingStep = ONBOARDING_STEPS.GOALS;
+          return `Got it. Your main goal—scholarship, admission, job?`;
         }
-
-        if (!shouldRespond || !text) return;
-        console.log(`🤖 Processing message: "${text}" ${isNewConversation ? '(New)' : '(Continuing)'}`);
-        const aiReply = await getAIResponse(userId, msg);
-
-        if (isGroup) {
-          if (sendPrivately) {
-            await sock.sendMessage(senderId, { text: aiReply });
-            console.log(`📤 Sent private reply to ${senderId}`);
-          } else {
-            await sock.sendMessage(groupId, { text: aiReply });
-            console.log(`📤 Sent group reply to ${groupId}`);
-          }
-        } else {
-          await sock.sendMessage(senderId, { text: aiReply });
-          console.log(`📤 Sent private reply to ${senderId}`);
+        case ONBOARDING_STEPS.GOALS: {
+          profile.goals = messageText;
+          profile.onboardingStep = ONBOARDING_STEPS.COUNTRY;
+          return `Cool. Which country are you in / targeting?`;
         }
-      } catch (err) {
-        console.error('messages.upsert error:', err);
-      }
-    });
-
-    // Keep alive + presence + cleanup
-    setInterval(() => { try { if (sock?.ws && sock.ws.readyState === 1) sock.ws.ping(); } catch {} }, 30000);
-    setInterval(async () => { try { if (sock?.user) await sock.sendPresenceUpdate('available'); } catch {} }, 60000);
-    setInterval(() => {
-      const now = Date.now();
-      for (const [key, conv] of activeConversations.entries()) {
-        if (now - conv.lastActivity >= CONVERSATION_TIMEOUT) {
-          activeConversations.delete(key);
-          console.log(`🧹 Cleaned expired conversation: ${key}`);
+        case ONBOARDING_STEPS.COUNTRY: {
+          profile.country = messageText;
+          profile.onboardingStep = ONBOARDING_STEPS.COMPLETE;
+          try { await createUserInDB(uid, profile); }
+          catch { try { await updateUserInDB(uid, profile); } catch (_) {} }
+          return `Profile saved ✅ Ask me anything about courses, unis, or apps.`;
         }
       }
-    }, 5 * 60 * 1000);
+    }
 
-    console.log('Bot started.');
-  } catch (err) {
-    console.error('startBot error:', err);
-    setTimeout(() => {
-      isStarting = false;
-      if (!shouldStop) startBot();
-    }, 2000);
-  } finally {
-    isStarting = false;
+    /* ==== Greeting ==== */
+    if (GREETING_PATTERNS.test(lowerMsg)) {
+      return `Hey ${profile.name || "there"} 👋 How can I help?`;
+    }
+
+    /* ==== Accommodation ==== */
+    if (ACCO_PATTERNS.test(lowerMsg)) {
+      const prefs = parseAccommodationQuery(messageText);
+      if (!prefs.place_name) return `Tell me the city/area + budget, e.g. "1 bed under £900 in Manchester".`;
+      const { listings } = await searchUKAccommodation(prefs);
+      return formatAccommodationReply(listings);
+    }
+
+    /* ==== Dataset ==== */
+    const result = await queryDataset(messageText, { max: 200 });
+    if (result && result.intent === "GENERAL") {
+      return await generateAIResponse(profile, messageText, profile.conversationHistory, "");
+    }
+    if (result && Array.isArray(result.rows) && result.rows.length) {
+      profile.lastRows = result.rows;
+      profile.lastOffset = Math.min(5, result.rows.length);
+      return formatCourseSlice(result.rows, 0, 5, result.text || "");
+    }
+    if (result && (!result.rows || !result.rows.length)) {
+      return await generateAIResponse(profile, messageText, profile.conversationHistory, "");
+    }
+
+    return `I’m not sure yet. Tell me the subject, level (UG/PG), preferred campus/city, and start month—I'll suggest options.`;
+  } catch (error) {
+    console.error("getAIResponse error:", error.message);
+    return "Sorry, something went wrong.";
   }
 }
 
-startBot();
-
-// reminders
-startReminderScheduler(async (userId, text) => {
-  await sock.sendMessage(userId, { text });
-});
-
-process.on('SIGINT', async () => {
-  console.log('\n👋 Shutting down...');
-  shouldStop = true;
-  try { if (sock && sock.ws && sock.ws.readyState === 1) await sock.end(); } catch {}
-  server.close(() => process.exit(0));
-});
+/* ============================
+   Exports
+============================= */
+module.exports = {
+  getAIResponse,
+  clearUserData: (userId) => activeSessions.delete(userId),
+  getUserStats: async () => {
+    try {
+      const { count: totalUsers } = await supabase.from("users").select("*", { count: "exact", head: true });
+      const { count: activeUsers } = await supabase.from("users")
+        .select("*", { count: "exact", head: true })
+        .gte("last_interaction", new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString());
+      return { totalUsers: totalUsers || 0, activeUsers: activeUsers || 0, activeSessions: activeSessions.size };
+    } catch {
+      return { totalUsers: 0, activeUsers: 0, activeSessions: activeSessions.size };
+    }
+  },
+};
