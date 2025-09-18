@@ -1,7 +1,7 @@
 const { supabase } = require("./config");
 
 /* ============================
-   Messaging adapters (injected from server.js)
+   Messaging adapter (injected from server.js)
 ============================= */
 let sendFn = null;
 function initMatch({ send }) {
@@ -66,12 +66,8 @@ async function findNearby(userId, lat, lon, radiusKm = 10, limit = 5) {
     .slice(0, limit);
 }
 
-function makeCode() {
-  return String(Math.floor(100000 + Math.random() * 900000));
-}
-
 /* ============================
-   Main functions
+   Main function
 ============================= */
 async function handleConnectIntent({ requesterId, topic = "", radiusKm = 10 }) {
   if (!sendFn) return "Messaging not ready—try again in a moment.";
@@ -92,97 +88,21 @@ async function handleConnectIntent({ requesterId, topic = "", radiusKm = 10 }) {
     return `I couldn’t find discoverable students within ~${radiusKm} km. Ask friends to enable discoverability or widen the radius.`;
   }
 
+  // Send each candidate’s info directly
+  let replyLines = [`Here are some nearby students${topic ? " about *" + topic + "*" : ""}:`];
   for (const cand of candidates) {
-    const code = makeCode();
-    const { error } = await supabase.from("match_invites").insert([
-      {
-        code,
-        requester_id: requesterId,
-        invitee_id: cand.user_id,
-        topic,
-        lat: me.lat,
-        lon: me.lon,
-        distance_km: cand.distance_km,
-      },
-    ]);
-    if (error) {
-      console.error("invite insert error:", error);
-      continue;
-    }
+    replyLines.push(
+      `\n👤 ${cand.name || "Student"}\n📍 ~${Math.round(cand.distance_km)} km away\n💬 wa.me/${cand.user_id.split("@")[0]}`
+    );
 
-    const intro = {
-      text: [
-        `👋 Hi${cand.name ? " " + cand.name : ""}!`,
-        `A nearby student wants to connect${
-          topic ? " about *" + topic + "*" : ""
-        }.`,
-        `Distance: ~${Math.round(cand.distance_km)} km.`,
-        `Press the button below if you’d like to connect.`,
-      ].join("\n"),
-      buttons: [
-        {
-          buttonId: `ACCEPT_${code}`,
-          buttonText: { displayText: "✅ Connect Now" },
-          type: 1,
-        },
-      ],
-      headerType: 1,
-    };
-
-    await sendFn(cand.user_id, intro);
+    // Optionally also DM the candidate that someone might contact them
+    await sendFn(
+      cand.user_id,
+      `👋 A nearby student may reach out to you${topic ? " about *" + topic + "*" : ""}.`
+    );
   }
 
-  return `I’ve messaged a few nearby students${
-    topic ? " about *" + topic + "*" : ""
-  }. If someone accepts, I’ll share their contact with you.`;
-}
-
-async function handleAcceptCode(inviteeId, code) {
-  if (!sendFn) return "Messaging not ready—try again shortly.";
-
-  const { data, error } = await supabase
-    .from("match_invites")
-    .select("*")
-    .eq("invitee_id", inviteeId)
-    .eq("code", code)
-    .eq("accepted", false)
-    .limit(1);
-
-  if (error) {
-    console.error("invite fetch error:", error);
-    return "Something went wrong looking up that code.";
-  }
-  const invite = data?.[0];
-  if (!invite) return `That code isn't valid anymore.`;
-
-  const { error: updErr } = await supabase
-    .from("match_invites")
-    .update({ accepted: true })
-    .eq("id", invite.id);
-  if (updErr) {
-    console.error("invite update error:", updErr);
-    return "Could not accept that invite (db error).";
-  }
-
-  const requester = await getUser(invite.requester_id);
-  const invitee = await getUser(inviteeId);
-
-  // ✅ Share WhatsApp numbers directly
-  await sendFn(
-    invite.requester_id,
-    `✅ ${invitee?.name || "A student"} accepted! You can message them at 👉 wa.me/${
-      inviteeId.split("@")[0]
-    }`
-  );
-
-  await sendFn(
-    inviteeId,
-    `✅ Connected with ${
-      requester?.name || "a student"
-    }! You can message them at 👉 wa.me/${invite.requester_id.split("@")[0]}`
-  );
-
-  return `You’re now connected directly 🎉`;
+  return replyLines.join("\n");
 }
 
 /* ============================
@@ -191,5 +111,4 @@ async function handleAcceptCode(inviteeId, code) {
 module.exports = {
   initMatch,
   handleConnectIntent,
-  handleAcceptCode,
 };

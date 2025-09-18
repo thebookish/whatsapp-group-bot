@@ -425,13 +425,13 @@ const lowerMsg = messageText ? messageText.toLowerCase() : "";
     // }
 
     /* ==== Accept code ==== */
-  /* ==== Accept code ==== */
-if (typeof messageText === "string") {
-  const acceptHit = messageText.match(ACCEPT_PAT);
-  if (acceptHit) {
-    return await handleAcceptCode(uid, acceptHit[1]);
-  }
-}
+//   /* ==== Accept code ==== */
+// if (typeof messageText === "string") {
+//   const acceptHit = messageText.match(ACCEPT_PAT);
+//   if (acceptHit) {
+//     return await handleAcceptCode(uid, acceptHit[1]);
+//   }
+// }
 
     /* ==== Connect me ==== */
     if (CONNECT_PAT.test(messageText)) {
