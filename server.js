@@ -1,3 +1,4 @@
+// server.js
 const express = require('express');
 const path = require('path');
 const {
@@ -7,14 +8,13 @@ const {
 } = require('@whiskeysockets/baileys');
 const { getAIResponse } = require('./ai');
 const { WebSocketServer } = require('ws');
-const { initMatch } = require('./match'); // ✅ NEW
-
+const { startReminderScheduler } = require('./reminder');
 const app = express();
 const PORT = 3000;
 const AUTH_DIR = 'auth_info_baileys';
 const KEEP_ALIVE_MS = 10000;
-const TRIGGER_KEYWORD = 'heybot';
-const CONVERSATION_TIMEOUT = 30 * 60 * 1000;
+const TRIGGER_KEYWORD = 'heybot'; // Trigger word to start conversation
+const CONVERSATION_TIMEOUT = 30 * 60 * 1000; // 30 minutes timeout
 
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('/health', (req, res) => res.json({ ok: true }));
@@ -35,8 +35,8 @@ let sock = null;
 let saveCreds = null;
 let isStarting = false;
 let shouldStop = false;
-let botJid = null;
-let activeConversations = new Map();
+let botJid = null; // Store bot's JID
+let activeConversations = new Map(); // Track active conversations
 
 function extractTextFromMessage(message) {
   if (!message) return '';
@@ -52,37 +52,64 @@ function extractTextFromMessage(message) {
 
 function isBotMentioned(message, botJid) {
   if (!message || !botJid) return false;
-  if (message.extendedTextMessage?.contextInfo?.mentionedJid?.includes(botJid)) return true;
-  if (message.contextInfo?.mentionedJid?.includes(botJid)) return true;
+  
+  // Check for mentions in extendedTextMessage
+  if (message.extendedTextMessage?.contextInfo?.mentionedJid?.includes(botJid)) {
+    return true;
+  }
+  
+  // Check for mentions in regular message
+  if (message.contextInfo?.mentionedJid?.includes(botJid)) {
+    return true;
+  }
+  
   return false;
 }
+
 function isBotRepliedTo(message, botJid) {
   if (!message || !botJid) return false;
+  
+  // Check if this is a reply to bot's message
   const quotedMsg = message.extendedTextMessage?.contextInfo?.quotedMessage;
   const stanzaId = message.extendedTextMessage?.contextInfo?.stanzaId;
   const participant = message.extendedTextMessage?.contextInfo?.participant;
-  if (participant === botJid || (quotedMsg && stanzaId)) return true;
+  
+  // If replying to a message from the bot
+  if (participant === botJid || (quotedMsg && stanzaId)) {
+    return true;
+  }
+  
   return false;
 }
 
 function isConversationActive(conversationKey) {
   const conversation = activeConversations.get(conversationKey);
   if (!conversation) return false;
+  
   const now = Date.now();
   const isActive = now - conversation.lastActivity < CONVERSATION_TIMEOUT;
+  
   if (!isActive) {
     activeConversations.delete(conversationKey);
     console.log(`⏰ Conversation timeout: ${conversationKey}`);
   }
+  
   return isActive;
 }
+
 function startConversation(conversationKey) {
-  activeConversations.set(conversationKey, { startTime: Date.now(), lastActivity: Date.now() });
+  activeConversations.set(conversationKey, {
+    startTime: Date.now(),
+    lastActivity: Date.now()
+  });
   console.log(`🆕 Started conversation: ${conversationKey}`);
 }
+
 function updateConversationActivity(conversationKey) {
   const conversation = activeConversations.get(conversationKey);
-  if (conversation) conversation.lastActivity = Date.now();
+  if (conversation) {
+    conversation.lastActivity = Date.now();
+  }
 }
 
 async function startBot() {
@@ -95,7 +122,11 @@ async function startBot() {
     saveCreds = _saveCreds;
 
     if (sock) {
-      try { if (sock.ws && sock.ws.readyState === 1) await sock.end(); } catch {}
+      try {
+        if (sock.ws && sock.ws.readyState === 1) {
+          await sock.end();
+        }
+      } catch {}
       sock = null;
     }
 
@@ -115,21 +146,16 @@ async function startBot() {
 
       if (connection === 'open') {
         console.log('✅ WhatsApp connected');
-        botJid = sock.user.id;
+        botJid = sock.user.id; // Store bot's JID when connected
         console.log('🤖 Bot JID:', botJid);
         broadcast({ type: 'status', status: 'connected' });
-
-        // ✅ init match after socket is ready
-        initMatch({
-          send: (jid, text) => sock.sendMessage(jid, { text }),
-          createGroup: (subject, jids) => sock.groupCreate(subject, jids),
-        });
-
       } else if (connection === 'close') {
         const reason = lastDisconnect?.error?.output?.statusCode;
         const isLoggedOut = reason === DisconnectReason.loggedOut;
+
         console.log('🔌 Connection closed.', reason, 'loggedOut:', isLoggedOut);
         broadcast({ type: 'status', status: 'disconnected', reason });
+
         if (!isLoggedOut) {
           setTimeout(() => {
             isStarting = false;
@@ -156,12 +182,14 @@ async function startBot() {
         const groupId = isGroup ? remoteJid : null;
         const participantId = msg.key.participant || remoteJid;
         const senderId = isGroup ? participantId : remoteJid;
-        const userId = isGroup ? participantId : remoteJid;
+        const userId = isGroup ? participantId : remoteJid;      // Always user’s JID (not group JID)
 
-        const conversationKey = isGroup ? `${remoteJid}_${participantId}` : remoteJid;
+// Use different key for conversation state management
+const conversationKey = isGroup ? `${remoteJid}_${participantId}` : remoteJid;
 
         let text = extractTextFromMessage(msg.message);
-        if (!text && !msg.message?.locationMessage) return; // allow location-only
+        if (!text?.trim()) return;
+        text = text.trim();
 
         let shouldRespond = false;
         let sendPrivately = false;
@@ -169,33 +197,47 @@ async function startBot() {
 
         if (isGroup) {
           const conversationActive = isConversationActive(conversationKey);
-          const startsWithTrigger = (text || '').toLowerCase().startsWith(TRIGGER_KEYWORD.toLowerCase());
-
+          
+          // Check if message starts with trigger word
+          const startsWithTrigger = text.toLowerCase().startsWith(TRIGGER_KEYWORD.toLowerCase());
+          
           if (startsWithTrigger) {
+            // Start new conversation or continue existing one
             if (!conversationActive) {
               startConversation(conversationKey);
               isNewConversation = true;
             }
             shouldRespond = true;
-            text = (text || '').slice(TRIGGER_KEYWORD.length).trim();
+            
+            // Remove trigger word from text
+            text = text.slice(TRIGGER_KEYWORD.length).trim();
             console.log(`🎯 Trigger word used in group ${groupId} by ${participantId}`);
+            
           } else if (conversationActive) {
+            // Check if bot is mentioned or replied to in active conversation
             const isMentioned = isBotMentioned(msg.message, botJid);
             const isRepliedTo = isBotRepliedTo(msg.message, botJid);
+            
             if (isMentioned || isRepliedTo) {
               shouldRespond = true;
               updateConversationActivity(conversationKey);
               console.log(`🎯 Bot ${isMentioned ? 'mentioned' : 'replied to'} in active conversation ${conversationKey}`);
-              if (isMentioned && text) text = text.replace(/@\d+/g, '').trim();
+              
+              // Clean up mention from text if present
+              if (isMentioned) {
+                text = text.replace(/@\d+/g, '').trim();
+              }
             }
           }
-
-          if (shouldRespond && /reply\s+me\s+privately|dm\s+me|private\s+reply/i.test(text || '')) {
+          
+          // Check for private reply request
+          if (shouldRespond && /reply\s+me\s+privately|dm\s+me|private\s+reply/i.test(text)) {
             sendPrivately = true;
-            text = (text || '').replace(/reply\s+me\s+privately|dm\s+me|private\s+reply/gi, '').trim();
+            text = text.replace(/reply\s+me\s+privately|dm\s+me|private\s+reply/gi, '').trim();
           }
-
+          
         } else {
+          // In private chats, always respond and maintain conversation
           if (!isConversationActive(conversationKey)) {
             startConversation(conversationKey);
             isNewConversation = true;
@@ -206,13 +248,10 @@ async function startBot() {
           console.log(`💬 Private message from ${senderId}`);
         }
 
-        if (!shouldRespond) return;
+        if (!shouldRespond || !text) return;
 
-        console.log(`🤖 Processing message: "${text || '[non-text]'}" ${isNewConversation ? '(New conversation)' : '(Continuing conversation)'}`);
-        // ✅ pass the full msg so ai.js can read locationMessage when needed
-        const aiReply = await getAIResponse(userId, msg);
-
-        if (!aiReply) return;
+        console.log(`🤖 Processing message: "${text}" ${isNewConversation ? '(New conversation)' : '(Continuing conversation)'}`);
+        const aiReply = await getAIResponse(userId, text);
 
         if (isGroup) {
           if (sendPrivately) {
@@ -233,10 +272,14 @@ async function startBot() {
 
     // Keep-alive ping
     setInterval(() => {
-      try { if (sock?.ws && sock.ws.readyState === 1) sock.ws.ping(); } catch {}
+      try {
+        if (sock?.ws && sock.ws.readyState === 1) {
+          sock.ws.ping();
+        }
+      } catch {}
     }, 30000);
 
-    // Presence update every minute
+    // Presence update every minute to look active
     setInterval(async () => {
       try {
         if (sock?.user) {
@@ -248,16 +291,18 @@ async function startBot() {
       }
     }, 60000);
 
-    // Cleanup expired conversations
+    // Cleanup expired conversations every 5 minutes
     setInterval(() => {
       const now = Date.now();
       let cleanedCount = 0;
+      
       for (const [key, conversation] of activeConversations.entries()) {
         if (now - conversation.lastActivity >= CONVERSATION_TIMEOUT) {
           activeConversations.delete(key);
           cleanedCount++;
         }
       }
+      
       if (cleanedCount > 0) {
         console.log(`🧹 Cleaned up ${cleanedCount} expired conversations. Active: ${activeConversations.size}`);
       }
@@ -276,6 +321,12 @@ async function startBot() {
 }
 
 startBot();
+// Check reminders every 30 seconds
+
+// after sock is ready
+startReminderScheduler(async (userId, text) => {
+  await sock.sendMessage(userId, { text });
+});
 
 process.on('SIGINT', async () => {
   console.log('\n👋 Shutting down...');
