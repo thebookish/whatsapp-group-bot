@@ -7,32 +7,52 @@ let sendFn = null;
 function initMatch({ send }) {
   sendFn = send;
 }
-async function upsertUserLocation(userId, { lat, lon, city = null, discoverable = true, radiusKm = 10 }) {
-  try {
-    const { data, error } = await supabase
-      .from("users")
-      .upsert(
-        {
-          user_id: userId,
-          lat,
-          lon,
-          city,
-          discoverable,
-          discoverable_radius_km: radiusKm,
-          last_location_at: new Date(),
-        },
-        { onConflict: "user_id" }
-      )
-      .select()
-      .single();
+/** 
+ * Upsert user location + discoverable settings
+ */
+async function upsertUserLocation(
+  userId,
+  { lat, lon, city = null, discoverable = true, radiusKm = 10 }
+) {
+  const updates = {
+    lat,
+    lon,
+    city,
+    discoverable,
+    discoverable_radius_km: radiusKm,
+    last_location_at: new Date().toISOString(),
+  };
 
-    if (error) throw error;
-    return data;
-  } catch (err) {
-    console.error("upsertUserLocation error:", err);
-    throw err;
+  // Try update
+  const { data, error } = await supabase
+    .from("users")
+    .update(updates)
+    .eq("user_id", userId)
+    .select("user_id");
+
+  if (error) throw error;
+
+  // If no row, insert a minimal user row
+  if (!data || data.length === 0) {
+    const { error: insErr } = await supabase.from("users").insert([
+      {
+        user_id: userId,
+        name: "",
+        interests: "",
+        goals: "",
+        country: "",
+        created_at: new Date(),
+        last_interaction: new Date(),
+        ...updates,
+      },
+    ]);
+
+    if (insErr) throw insErr;
   }
+
+  return true;
 }
+
 
 /* ============================
    Helpers
