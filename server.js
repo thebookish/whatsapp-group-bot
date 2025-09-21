@@ -4,7 +4,8 @@ const path = require('path');
 const {
   default: makeWASocket,
   DisconnectReason,
-  useMultiFileAuthState
+  useMultiFileAuthState,
+  jidNormalizedUser
 } = require('@whiskeysockets/baileys');
 const { getAIResponse } = require('./ai');
 const { initMatch } = require('./match');
@@ -44,8 +45,17 @@ let botJid = null;
 let activeConversations = new Map();
 
 /* ============================
-   Message utils
+   Utils
 ============================= */
+function normalizeJid(jid) {
+  if (!jid) return null;
+  try {
+    return jidNormalizedUser(jid); // always returns xxx@s.whatsapp.net
+  } catch {
+    return jid;
+  }
+}
+
 function extractTextFromMessage(message) {
   if (!message) return '';
   if (typeof message === 'string') return message;
@@ -129,10 +139,9 @@ async function startBot() {
       keepAliveIntervalMs: KEEP_ALIVE_MS,
     });
 
-    /* === init match system with send + createGroup === */
+    /* === init match system with send === */
     initMatch({
-      send: async (jid, text) => { await sock.sendMessage(jid, { text }); },
-      createGroup: async (subject, jids) => await sock.groupCreate(subject, jids),
+      send: async (jid, msg) => { await sock.sendMessage(jid, typeof msg === 'string' ? { text: msg } : msg); }
     });
 
     sock.ev.on('connection.update', (update) => {
@@ -143,7 +152,7 @@ async function startBot() {
       }
       if (connection === 'open') {
         console.log('✅ WhatsApp connected');
-        botJid = sock.user.id;
+        botJid = normalizeJid(sock.user.id);
         console.log('🤖 Bot JID:', botJid);
         broadcast({ type: 'status', status: 'connected' });
       } else if (connection === 'close') {
@@ -172,10 +181,10 @@ async function startBot() {
       try {
         if (!messages?.[0] || messages[0].key.fromMe) return;
         const msg = messages[0];
-        const remoteJid = msg.key.remoteJid || '';
+        const remoteJid = normalizeJid(msg.key.remoteJid || '');
         const isGroup = remoteJid.endsWith('@g.us');
         const groupId = isGroup ? remoteJid : null;
-        const participantId = msg.key.participant || remoteJid;
+        const participantId = normalizeJid(msg.key.participant || remoteJid);
         const senderId = isGroup ? participantId : remoteJid;
         const userId = isGroup ? participantId : remoteJid;
 
@@ -223,6 +232,8 @@ async function startBot() {
         const inputForAI = text || msg;
         console.log(`🤖 Processing: "${text || '[non-text message]'}" ${isNewConversation ? '(New)' : '(Cont.)'}`);
         const aiReply = await getAIResponse(userId, inputForAI);
+
+        if (!aiReply) return;
 
         if (isGroup) {
           if (sendPrivately) {
