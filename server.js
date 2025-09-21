@@ -4,8 +4,7 @@ const path = require('path');
 const {
   default: makeWASocket,
   DisconnectReason,
-  useMultiFileAuthState,
-  jidNormalizedUser
+  useMultiFileAuthState
 } = require('@whiskeysockets/baileys');
 const { getAIResponse } = require('./ai');
 const { initMatch } = require('./match');
@@ -33,17 +32,6 @@ function broadcast(data) {
     if (client.readyState === 1) client.send(str);
   });
 }
-
-/* ============================
-   State
-============================= */
-let sock = null;
-let saveCreds = null;
-let isStarting = false;
-let shouldStop = false;
-let botJid = null;
-let activeConversations = new Map();
-
 /* ============================
    Utils
 ============================= */
@@ -55,7 +43,19 @@ function normalizeJid(jid) {
     return jid;
   }
 }
+/* ============================
+   State
+============================= */
+let sock = null;
+let saveCreds = null;
+let isStarting = false;
+let shouldStop = false;
+let botJid = null;
+let activeConversations = new Map();
 
+/* ============================
+   Message utils
+============================= */
 function extractTextFromMessage(message) {
   if (!message) return '';
   if (typeof message === 'string') return message;
@@ -139,9 +139,10 @@ async function startBot() {
       keepAliveIntervalMs: KEEP_ALIVE_MS,
     });
 
-    /* === init match system with send === */
+    /* === init match system with send + createGroup === */
     initMatch({
-      send: async (jid, msg) => { await sock.sendMessage(jid, typeof msg === 'string' ? { text: msg } : msg); }
+      send: async (jid, text) => { await sock.sendMessage(jid, { text }); },
+      createGroup: async (subject, jids) => await sock.groupCreate(subject, jids),
     });
 
     sock.ev.on('connection.update', (update) => {
@@ -152,7 +153,7 @@ async function startBot() {
       }
       if (connection === 'open') {
         console.log('✅ WhatsApp connected');
-        botJid = normalizeJid(sock.user.id);
+        botJid = sock.user.id;
         console.log('🤖 Bot JID:', botJid);
         broadcast({ type: 'status', status: 'connected' });
       } else if (connection === 'close') {
@@ -232,8 +233,6 @@ async function startBot() {
         const inputForAI = text || msg;
         console.log(`🤖 Processing: "${text || '[non-text message]'}" ${isNewConversation ? '(New)' : '(Cont.)'}`);
         const aiReply = await getAIResponse(userId, inputForAI);
-
-        if (!aiReply) return;
 
         if (isGroup) {
           if (sendPrivately) {
