@@ -4,7 +4,8 @@ const path = require('path');
 const {
   default: makeWASocket,
   DisconnectReason,
-  useMultiFileAuthState
+  useMultiFileAuthState,
+  jidNormalizedUser
 } = require('@whiskeysockets/baileys');
 const { getAIResponse } = require('./ai');
 const { initMatch } = require('./match');
