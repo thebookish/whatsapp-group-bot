@@ -19,50 +19,17 @@ const ONBOARDING_STEPS = {
   COUNTRY: 4,
   COMPLETE: 0,
 };
+
+const activeSessions = new Map();
+
+/* ============================
+   Patterns
+============================= */
 const GREETING_PATTERNS = /\b(hello|hi|hey)\b/i;
 const ACCO_PATTERNS =
   /\b(accommodation|accomodation|rent|room|flat|house|hall|student hall|dorm|hostel)\b/i;
 const MORE_PATTERNS = /^(more|next|show me more|see more)\b/i;
 const ACCEPT_PAT = /^accept\s+(\d{4,6})$/i;
-
-const activeSessions = new Map();
-
-/* ============================
-   Intent Classifier (LLM)
-============================= */
-async function classifyIntent(messageText) {
-  try {
-    const res = await axios.post(
-      "https://openrouter.ai/api/v1/chat/completions",
-      {
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content: `Classify the student's intent into one of:
-[reminder, connect, accommodation, course, general].
-Rules:
-- "connect" also covers: find me someone nearby, match me, buddy, peer, student, friend, etc.
-- "reminder" also covers: set reminder, remind me, alarm, notify me.
-- "accommodation" also covers: housing, rent, dorm, hostel, flat, hall.
-- If it's about courses, unis, applications → "course".
-- Otherwise → "general".
-Respond with only one word.`,
-          },
-          { role: "user", content: messageText },
-        ],
-        max_tokens: 5,
-        temperature: 0,
-      },
-      { headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}` } }
-    );
-
-    return res.data?.choices?.[0]?.message?.content?.toLowerCase().trim() || "general";
-  } catch (err) {
-    console.error("intent classify error:", err.message);
-    return "general";
-  }
-}
 
 /* ============================
    Helpers
@@ -108,9 +75,26 @@ function validateMessage(msg) {
   if (msg.length > 1000) throw new Error("Message too long");
   return msg.trim();
 }
+function isGreetingOnly(text) {
+  const cleaned = text.toLowerCase().replace(/[^a-z\s']/g, " ").trim();
+  if (!cleaned) return false;
+  const words = cleaned.split(/\s+/).filter(Boolean);
+  return words.length > 0 && words.every((w) => /(hello|hi|hey|start|begin)/.test(w));
+}
+function extractNameFromText(text) {
+  const p1 = /(my name is|i am|i'm|this is)\s+([^\n,.;!?]+)/i.exec(text);
+  if (p1 && p1[2]) return p1[2].trim();
+  const p2 = /^(hello|hi|hey)[\s,!:;-]*(.*)$/i.exec(text.trim());
+  if (p2 && p2[2]) {
+    const rest = p2[2].trim();
+    if (rest) return rest;
+  }
+  if (!isGreetingOnly(text) && text.trim().length <= 60) return text.trim();
+  return "";
+}
 
 /* ============================
-   Supabase DB Helpers
+   Supabase Helpers
 ============================= */
 async function checkUserExists(userId) {
   try {
@@ -122,27 +106,26 @@ async function checkUserExists(userId) {
     if (error && error.code !== "PGRST116") throw error;
     return { exists: !!data, user: data || null };
   } catch (error) {
+    console.error("Error checking user existence:", error);
     return { exists: false, user: null };
   }
 }
 async function createUserInDB(userId, profile) {
-  await supabase.from("users").insert([
-    {
-      user_id: userId,
-      name: profile.name,
-      interests: profile.interests,
-      goals: profile.goals,
-      country: profile.country,
-      created_at: new Date(),
-      last_interaction: new Date(),
-    },
-  ]);
+  await supabase.from("users").insert([{
+    user_id: userId,
+    name: profile.name,
+    interests: profile.interests,
+    goals: profile.goals,
+    country: profile.country,
+    created_at: new Date(),
+    last_interaction: new Date(),
+  }]);
 }
 async function updateUserInDB(userId, updates) {
-  await supabase
-    .from("users")
-    .update({ ...updates, last_interaction: new Date() })
-    .eq("user_id", userId);
+  await supabase.from("users").update({
+    ...updates,
+    last_interaction: new Date(),
+  }).eq("user_id", userId);
 }
 async function getConversationHistory(userId) {
   const { data } = await supabase
@@ -154,9 +137,12 @@ async function getConversationHistory(userId) {
   return data || [];
 }
 async function saveConversation(userId, message, response) {
-  await supabase.from("conversations").insert([
-    { user_id: userId, message, response, created_at: new Date() },
-  ]);
+  await supabase.from("conversations").insert([{
+    user_id: userId,
+    message,
+    response,
+    created_at: new Date(),
+  }]);
 }
 
 /* ============================
@@ -178,11 +164,11 @@ async function handleReminder(uid, messageText) {
 }
 
 /* ============================
-   Accommodation Helpers (UK)
+   Accommodation
 ============================= */
 function parseAccommodationQuery(text) {
   const q = normBase(text);
-  const priceMatch = q.match(/\b(?:under|<=?|max|up to)\s*[£$]?\s*(\d{2,5})\b/) || q.match(/\b[£$]\s*(\d{2,5})\b/);
+  const priceMatch = q.match(/\b(?:under|<=?|max|up to)\s*[£$]?\s*(\d{2,5})\b/);
   const price_max = priceMatch ? parseInt(priceMatch[1], 10) : undefined;
   let bedrooms;
   const bedMatch = q.match(/\b(\d)\s*(?:bed|beds|bedroom|bedrooms)\b/);
@@ -193,38 +179,48 @@ function parseAccommodationQuery(text) {
   if (locMatch) place_name = locMatch[1].trim();
   return { place_name, price_max, bedrooms };
 }
-async function searchUKAccommodation(prefs) {
-  if (!prefs.place_name) return { listings: [], meta: { message: "No location provided" } };
+
+async function searchUKAccommodation({ place_name, price_max, bedrooms, page = 1, num = 8 }) {
+  if (!place_name) return { listings: [] };
   const params = {
     encoding: "json",
     action: "search_listings",
     country: "uk",
     listing_type: "rent",
-    page: 1,
-    number_of_results: 8,
-    place_name: prefs.place_name,
+    page,
+    number_of_results: num,
+    place_name,
   };
-  if (prefs.price_max) params.price_max = prefs.price_max;
-  try {
-    const r = await axios.get(NESTORIA_ENDPOINT, { params, timeout: 15000 });
-    const body = r.data?.response || {};
-    const listings = (body.listings || []).map((x) => ({
-      title: x.title || `${x.bedroom_number || ""} bed ${x.property_type || "property"}`.trim(),
-      price_formatted: x.price_formatted || `£${x.price} pcm`,
-      address: x.formatted_address || "",
-      url: x.lister_url || "",
-    }));
-    return { listings };
-  } catch {
-    return { listings: [] };
+  if (price_max) params.price_max = price_max;
+  if (typeof bedrooms === "number") {
+    if (bedrooms === 0) params.bedroom_max = 0;
+    else {
+      params.bedroom_min = bedrooms;
+      params.bedroom_max = bedrooms;
+    }
   }
+  const r = await axios.get(NESTORIA_ENDPOINT, { params });
+  const body = r.data?.response || {};
+  return { listings: body.listings || [] };
 }
 function formatAccommodationReply(listings) {
-  if (!listings.length) return "Couldn’t find live listings—try another area or raise budget.";
-  return listings
-    .slice(0, 5)
-    .map((l) => `• ${l.title} – ${l.price_formatted}\n  ${l.address}${l.url ? `\n  ${l.url}` : ""}`)
-    .join("\n");
+  if (!listings.length) return "Couldn’t find live listings for that.";
+  return listings.slice(0, 5).map(
+    (l) => `• ${l.title || "Property"} – ${l.price_formatted || ""}\n  ${l.formatted_address || ""}${l.lister_url ? `\n  ${l.lister_url}` : ""}`
+  ).join("\n");
+}
+
+/* ============================
+   Intent Classifier
+============================= */
+function detectIntent(text) {
+  const t = text.toLowerCase();
+  if (/remind|reminder|notify|alarm/.test(t)) return "reminder";
+  if (/connect|find|match|buddy|peer|student|friend/.test(t) && /near|nearby|around|close|here/.test(t)) return "connect";
+  if (/accommodation|room|flat|house|rent|hall|dorm|hostel/.test(t)) return "accommodation";
+  if (/accept\s+\d{4,6}/.test(t)) return "accept";
+  if (/hello|hi|hey/.test(t)) return "greeting";
+  return "general";
 }
 
 /* ============================
@@ -235,10 +231,10 @@ async function getAIResponse(userId, rawMessage) {
     const uid = validateUserId(userId);
     let messageText = typeof rawMessage === "object" ? extractTextFromMessage(rawMessage) : rawMessage;
 
-    // ✅ Special-case: location messages
+    // Location messages
     const locMsg = rawMessage?.message?.locationMessage;
     if (!messageText) {
-      if (locMsg) {
+      if (locMsg && typeof locMsg.degreesLatitude === "number") {
         await upsertUserLocation(uid, {
           lat: locMsg.degreesLatitude,
           lon: locMsg.degreesLongitude,
@@ -247,60 +243,104 @@ async function getAIResponse(userId, rawMessage) {
           radiusKm: 10,
         });
         return "📍 Got your location. You’re now discoverable to nearby students!";
-      }
-      return "Text only please 🙂";
+      } else return "Text only please 🙂";
     }
 
     messageText = validateMessage(messageText);
     const lowerMsg = messageText.toLowerCase();
 
-    /* ==== Intent detection ==== */
-    const intent = await classifyIntent(messageText);
-
-    // Accept code
-    const acceptHit = messageText.match(ACCEPT_PAT);
-    if (acceptHit) return await handleAcceptCode(uid, acceptHit[1]);
-
-    // Reminder
-    if (intent === "reminder" || /remind|reminder|alarm/i.test(lowerMsg)) {
-      return await handleReminder(uid, messageText);
+    const { exists, user } = await checkUserExists(uid);
+    let profile;
+    if (activeSessions.has(uid)) profile = activeSessions.get(uid);
+    else if (exists && user) {
+      profile = {
+        name: user.name || "",
+        interests: user.interests || "",
+        goals: user.goals || "",
+        country: user.country || "",
+        onboardingStep: ONBOARDING_STEPS.COMPLETE,
+        conversationHistory: await getConversationHistory(uid),
+        lastRows: null,
+        lastOffset: 0,
+      };
+      activeSessions.set(uid, profile);
+      await updateUserInDB(uid, {});
+    } else {
+      profile = createUserProfile();
+      activeSessions.set(uid, profile);
     }
 
-    // Connect
+    /* ==== Intent Detection ==== */
+    const intent = detectIntent(messageText);
+
     if (intent === "connect") {
-      const topicMatch = messageText.match(/\b(?:about|on|for)\s+(.{3,60})$/i);
+      const topicMatch = messageText.match(/\b(?:about|for)\s+(.{3,60})$/i);
       const topic = topicMatch ? topicMatch[1].trim() : "";
       return await handleConnectIntent({ requesterId: uid, topic, radiusKm: 10 });
     }
 
-    // Accommodation
-    if (intent === "accommodation" || ACCO_PAT.test(lowerMsg)) {
+    if (intent === "accept") {
+      const m = messageText.match(ACCEPT_PAT);
+      if (m) return await handleAcceptCode(uid, m[1]);
+    }
+
+    if (intent === "reminder") {
+      return await handleReminder(uid, messageText);
+    }
+
+    if (intent === "accommodation") {
       const prefs = parseAccommodationQuery(messageText);
       if (!prefs.place_name) return `Tell me the city/area + budget, e.g. "1 bed under £900 in Manchester".`;
       const { listings } = await searchUKAccommodation(prefs);
       return formatAccommodationReply(listings);
     }
 
-    // Course / Dataset
-    if (intent === "course") {
-      const result = await queryDataset(messageText, { max: 200 });
-      if (result?.rows?.length) return formatCourseSlice(result.rows, 0, 5, result.text || "");
+    if (intent === "greeting") {
+      return `Hey ${profile.name || "there"} 👋 How can I help?`;
     }
 
-    // Greeting
-    if (GREETING_PATTERNS.test(lowerMsg)) return `Hey 👋 How can I help?`;
+    /* ==== Onboarding ==== */
+    if (profile.onboardingStep !== ONBOARDING_STEPS.COMPLETE) {
+      switch (profile.onboardingStep) {
+        case ONBOARDING_STEPS.NAME:
+          if (isGreetingOnly(messageText)) return `Hey! I’m your study buddy. What’s your name?`;
+          const name = extractNameFromText(messageText);
+          if (!name) return `All good—tell me your name (e.g., "I'm Nabil Hasan").`;
+          profile.name = name;
+          profile.onboardingStep = ONBOARDING_STEPS.INTERESTS;
+          return `Nice to meet you, ${profile.name}! What subjects are you into?`;
+        case ONBOARDING_STEPS.INTERESTS:
+          profile.interests = messageText;
+          profile.onboardingStep = ONBOARDING_STEPS.GOALS;
+          return `Got it. What’s your main goal—scholarship, admission, job?`;
+        case ONBOARDING_STEPS.GOALS:
+          profile.goals = messageText;
+          profile.onboardingStep = ONBOARDING_STEPS.COUNTRY;
+          return `Cool. Which country are you in / targeting?`;
+        case ONBOARDING_STEPS.COUNTRY:
+          profile.country = messageText;
+          profile.onboardingStep = ONBOARDING_STEPS.COMPLETE;
+          await createUserInDB(uid, profile);
+          return `Profile saved ✅ Ask me anything about courses, unis, or apps.`;
+      }
+    }
 
-    // Default fallback: general AI
-    return "I’ll try to help! Could you clarify your request?";
+    /* ==== Dataset Fallback ==== */
+    const result = await queryDataset(messageText, { max: 200 });
+    if (result && Array.isArray(result.rows) && result.rows.length) {
+      profile.lastRows = result.rows;
+      profile.lastOffset = Math.min(5, result.rows.length);
+      return result.text + "\n\n" + result.rows.map((r) => r.course_title).join("\n");
+    }
+
+    return "I’m not sure yet. Tell me subject, level, campus/city, and start month—I'll suggest options.";
   } catch (err) {
-    console.error("getAIResponse error:", err);
+    console.error("getAIResponse error:", err.message);
     return "Sorry, something went wrong.";
   }
 }
 
-/* ============================
-   Exports
-============================= */
 module.exports = {
   getAIResponse,
+  clearUserData: (uid) => activeSessions.delete(uid),
 };
