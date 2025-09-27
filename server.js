@@ -191,7 +191,13 @@ async function startBot() {
         const userId = isGroup ? participantId : remoteJid;
 
         const conversationKey = isGroup ? `${remoteJid}_${participantId}` : remoteJid;
-
+        /* === Catch Accept button === */
+        if (msg.message?.buttonsResponseMessage?.selectedButtonId?.startsWith("ACCEPT_")) {
+          const code = msg.message.buttonsResponseMessage.selectedButtonId.replace("ACCEPT_", "");
+          const reply = await handleAcceptCode(userId, code);
+          await sock.sendMessage(userId, { text: reply });
+          return;
+        }
         let text = extractTextFromMessage(msg.message);
         if (text) text = text.trim();
 
