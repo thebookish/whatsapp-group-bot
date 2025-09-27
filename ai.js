@@ -304,14 +304,20 @@ async function getAIResponse(userId, rawMessage) {
   try {
     const uid = validateUserId(userId);
 
+    // Extract text safely
     let messageText =
       typeof rawMessage === "object"
         ? extractTextFromMessage(rawMessage)
         : rawMessage;
 
-    // Handle location
+    // 🔒 Always force string
+    if (typeof messageText !== "string") {
+      messageText = "";
+    }
+
+    // Handle location messages
     const locMsg = rawMessage?.message?.locationMessage;
-    if (!messageText) {
+    if (!messageText.trim()) {
       if (
         locMsg &&
         typeof locMsg.degreesLatitude === "number" &&
@@ -329,22 +335,22 @@ async function getAIResponse(userId, rawMessage) {
         } catch {
           return "❌ Failed to save your location.";
         }
-      } else return "Text only please 🙂";
+      } else {
+        return "Text only please 🙂";
+      }
     }
 
-    if (typeof messageText === "string") {
-      messageText = validateMessage(messageText);
-    }
-
-    const intent = detectIntent(
-      typeof messageText === "string" ? messageText : ""
-    );
+    // Validate + detect intent
+    messageText = validateMessage(messageText);
+    const intent = detectIntent(messageText);
     console.log("👉 Detected intent:", intent, "for:", messageText);
 
+    // Load or create user profile
     const { exists, user } = await checkUserExists(uid);
     let profile;
-    if (activeSessions.has(uid)) profile = activeSessions.get(uid);
-    else if (exists && user) {
+    if (activeSessions.has(uid)) {
+      profile = activeSessions.get(uid);
+    } else if (exists && user) {
       profile = {
         ...user,
         onboardingStep: ONBOARDING_STEPS.COMPLETE,
@@ -365,12 +371,10 @@ async function getAIResponse(userId, rawMessage) {
     /* ==== Intent routing ==== */
     if (intent === "connect") {
       let topic = "";
-      if (typeof messageText === "string") {
-        const topicMatch = messageText.match(
-          /\b(?:about|for|doing|interested in)\s+(.{3,60})$/i
-        );
-        topic = topicMatch ? topicMatch[1].trim() : "";
-      }
+      const topicMatch = messageText.match(
+        /\b(?:about|for|doing|interested in)\s+(.{3,60})$/i
+      );
+      if (topicMatch) topic = topicMatch[1].trim();
       return await handleConnectIntent({
         requesterId: uid,
         topic,
@@ -378,19 +382,19 @@ async function getAIResponse(userId, rawMessage) {
       });
     }
 
-    if (intent === "accommodation" && typeof messageText === "string") {
-      const prefs = parseAccommodationQuery(messageText);
+    if (intent === "accommodation") {
+      const prefs = parseAccommodationQuery(messageText || "");
       if (!prefs.place_name)
         return `Tell me the city/area + budget, e.g. "1 bed under £900 in Manchester".`;
       const { listings } = await searchUKAccommodation(prefs);
       return formatAccommodationReply(listings);
     }
 
-    if (intent === "reminder" && typeof messageText === "string") {
+    if (intent === "reminder") {
       return await handleReminder(uid, messageText);
     }
 
-    if (intent === "accept" && typeof messageText === "string") {
+    if (intent === "accept") {
       if (messageText.startsWith("ACCEPT_")) {
         const code = messageText.replace("ACCEPT_", "");
         return await handleAcceptCode(uid, code);
@@ -399,19 +403,22 @@ async function getAIResponse(userId, rawMessage) {
       if (m) return await handleAcceptCode(uid, m[1]);
     }
 
-    if (intent === "greeting")
+    if (intent === "greeting") {
       return `Hey ${profile.name || "there"} 👋 How can I help?`;
+    }
 
     /* ==== Pagination ==== */
     if (
-      typeof messageText === "string" &&
       MORE_PATTERNS.test(messageText) &&
       Array.isArray(profile.lastRows) &&
       profile.lastRows.length
     ) {
       const start = profile.lastOffset || 0;
       const reply = formatCourseSlice(profile.lastRows, start, 5);
-      profile.lastOffset = Math.min(start + 5, profile.lastRows.length);
+      profile.lastOffset = Math.min(
+        start + 5,
+        profile.lastRows.length
+      );
       return reply;
     } else {
       profile.lastRows = null;
@@ -420,64 +427,66 @@ async function getAIResponse(userId, rawMessage) {
 
     /* ==== Onboarding ==== */
     if (profile.onboardingStep !== ONBOARDING_STEPS.COMPLETE) {
-      if (typeof messageText === "string") {
-        switch (profile.onboardingStep) {
-          case ONBOARDING_STEPS.NAME: {
-            if (isGreetingOnly(messageText))
-              return `Hey! I’m your study buddy. What’s your name?`;
-            const name = extractNameFromText(messageText);
-            if (!name)
-              return `All good—tell me your name (e.g., "I'm Nabil Hasan").`;
-            profile.name = name;
-            profile.onboardingStep = ONBOARDING_STEPS.INTERESTS;
-            return `Nice to meet you, ${profile.name}! What subjects/fields are you into?`;
-          }
-          case ONBOARDING_STEPS.INTERESTS: {
-            profile.interests = messageText;
-            profile.onboardingStep = ONBOARDING_STEPS.GOALS;
-            return `Got it. Your main goal—scholarship, admission, job?`;
-          }
-          case ONBOARDING_STEPS.GOALS: {
-            profile.goals = messageText;
-            profile.onboardingStep = ONBOARDING_STEPS.COUNTRY;
-            return `Cool. Which country are you in / targeting?`;
-          }
-          case ONBOARDING_STEPS.COUNTRY: {
-            profile.country = messageText;
-            profile.onboardingStep = ONBOARDING_STEPS.COMPLETE;
+      switch (profile.onboardingStep) {
+        case ONBOARDING_STEPS.NAME: {
+          if (isGreetingOnly(messageText))
+            return `Hey! I’m your study buddy. What’s your name?`;
+          const name = extractNameFromText(messageText);
+          if (!name)
+            return `All good—tell me your name (e.g., "I'm Nabil Hasan").`;
+          profile.name = name;
+          profile.onboardingStep = ONBOARDING_STEPS.INTERESTS;
+          return `Nice to meet you, ${profile.name}! What subjects/fields are you into?`;
+        }
+        case ONBOARDING_STEPS.INTERESTS: {
+          profile.interests = messageText;
+          profile.onboardingStep = ONBOARDING_STEPS.GOALS;
+          return `Got it. Your main goal—scholarship, admission, job?`;
+        }
+        case ONBOARDING_STEPS.GOALS: {
+          profile.goals = messageText;
+          profile.onboardingStep = ONBOARDING_STEPS.COUNTRY;
+          return `Cool. Which country are you in / targeting?`;
+        }
+        case ONBOARDING_STEPS.COUNTRY: {
+          profile.country = messageText;
+          profile.onboardingStep = ONBOARDING_STEPS.COMPLETE;
+          try {
+            await createUserInDB(uid, profile);
+          } catch {
             try {
-              await createUserInDB(uid, profile);
-            } catch {
-              try {
-                await updateUserInDB(uid, profile);
-              } catch {}
-            }
-            return `Profile saved ✅ Ask me anything about courses, unis, or apps.`;
+              await updateUserInDB(uid, profile);
+            } catch {}
           }
+          return `Profile saved ✅ Ask me anything about courses, unis, or apps.`;
         }
       }
     }
 
     /* ==== Dataset fallback ==== */
-    if (typeof messageText === "string") {
-      const result = await queryDataset(messageText, { max: 200 });
-      if (result && result.intent === "GENERAL")
-        return await generateAIResponse(
-          profile,
-          messageText,
-          profile.conversationHistory,
-          ""
-        );
-      if (result && Array.isArray(result.rows) && result.rows.length) {
-        profile.lastRows = result.rows;
-        profile.lastOffset = Math.min(5, result.rows.length);
-        return formatCourseSlice(result.rows, 0, 5, result.text || "");
-      }
+    const result = await queryDataset(messageText, { max: 200 });
+    if (result && result.intent === "GENERAL")
+      return await generateAIResponse(
+        profile,
+        messageText,
+        profile.conversationHistory,
+        ""
+      );
+
+    if (result && Array.isArray(result.rows) && result.rows.length) {
+      profile.lastRows = result.rows;
+      profile.lastOffset = Math.min(5, result.rows.length);
+      return formatCourseSlice(
+        result.rows,
+        0,
+        5,
+        result.text || ""
+      );
     }
 
     return await generateAIResponse(
       profile,
-      typeof messageText === "string" ? messageText : "",
+      messageText,
       profile.conversationHistory,
       ""
     );
@@ -486,6 +495,7 @@ async function getAIResponse(userId, rawMessage) {
     return "Sorry, something went wrong.";
   }
 }
+
 
 
 /* ============================
