@@ -141,10 +141,13 @@ async function startBot() {
     });
 
     /* === init match system with send + createGroup === */
-    initMatch({
-      send: async (jid, text) => { await sock.sendMessage(jid, { text }); },
-      createGroup: async (subject, jids) => await sock.groupCreate(subject, jids),
-    });
+initMatch({
+  send: async (jid, content) => {
+    await sock.sendMessage(jid, content);
+  },
+  createGroup: async (subject, jids) => await sock.groupCreate(subject, jids),
+});
+
 
     sock.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect, qr } = update;
