@@ -340,11 +340,15 @@ async function getAIResponse(userId, rawMessage) {
     }
 
     /* ==== Intent routing ==== */
-    if (intent === "connect") {
-      const topicMatch = messageText.match(/\b(?:about|for|doing|interested in)\s+(.{3,60})$/i);
-      const topic = topicMatch ? topicMatch[1].trim() : "";
-      return await handleConnectIntent({ requesterId: uid, topic, radiusKm: 10 });
-    }
+if (intent === "connect") {
+  let topic = "";
+  if (typeof messageText === "string") {
+    const topicMatch = messageText.match(/\b(?:about|for|doing|interested in)\s+(.{3,60})$/i);
+    topic = topicMatch ? topicMatch[1].trim() : "";
+  }
+  return await handleConnectIntent({ requesterId: uid, topic, radiusKm: 10 });
+}
+
     if (intent === "accommodation") {
       const prefs = parseAccommodationQuery(messageText);
       if (!prefs.place_name) return `Tell me the city/area + budget, e.g. "1 bed under £900 in Manchester".`;
