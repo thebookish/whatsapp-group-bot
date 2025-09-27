@@ -353,8 +353,14 @@ async function getAIResponse(userId, rawMessage) {
     }
     if (intent === "reminder") return await handleReminder(uid, messageText);
     if (intent === "accept") {
-      const m = messageText.match(ACCEPT_PAT);
-      if (m) return await handleAcceptCode(uid, m[1]);
+      if (typeof messageText === "string") {
+        if (messageText.startsWith("ACCEPT_")) {
+          const code = messageText.replace("ACCEPT_", "");
+          return await handleAcceptCode(uid, code);
+        }
+        const m = messageText.match(ACCEPT_PAT);
+        if (m) return await handleAcceptCode(uid, m[1]);
+      }
     }
     if (intent === "greeting") return `Hey ${profile.name || "there"} 👋 How can I help?`;
 
