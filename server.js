@@ -143,9 +143,11 @@ async function startBot() {
     /* === init match system with send + createGroup === */
 initMatch({
   send: async (jid, content) => {
-   
+    if (typeof content === "string") {
+      await sock.sendMessage(jid, { text: content });
+    } else {
       await sock.sendMessage(jid, content); // allow buttons, lists, etc
-    
+    }
   },
   createGroup: async (subject, jids) => await sock.groupCreate(subject, jids),
 });
