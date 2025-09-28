@@ -115,20 +115,24 @@ async function handleConnectIntent({ requesterId, topic = "", radiusKm = 10 }) {
     }]);
 
 await sendFn(cand.user_id, {
-  text: `👋 Hi ${cand.name || "student"}!\nA nearby student wants to connect${
-    topic ? " about *" + topic + "*" : ""
-  }.\nDistance: ~${Math.round(cand.distance_km)} km.`,
-  templateButtons: [
-    {
-      index: 1,
-      quickReplyButton: {
-        displayText: "✅ Connect Now",
-        id: `ACCEPT_${code}`
-      },
+  templateMessage: {
+    hydratedTemplate: {
+      hydratedContentText: `👋 Hi ${cand.name || "student"}!\nA nearby student wants to connect${
+        topic ? " about *" + topic + "*" : ""
+      }.\nDistance: ~${Math.round(cand.distance_km)} km.`,
+      hydratedFooterText: "Press the button below to accept",
+      hydratedButtons: [
+        {
+          quickReplyButton: {
+            displayText: "✅ Connect Now",
+            id: `ACCEPT_${code}`,
+          },
+        },
+      ],
     },
-  ],
-  footer: "Press to accept",
+  },
 });
+
 
   }
 
