@@ -114,17 +114,22 @@ async function handleConnectIntent({ requesterId, topic = "", radiusKm = 10 }) {
       created_at: new Date(),
     }]);
 
-    await sendFn(cand.user_id, {
-      text: `👋 Hi ${cand.name || "student"}!\nA nearby student wants to connect${topic ? " about *" + topic + "*" : ""}.\nDistance: ~${Math.round(cand.distance_km)} km.`,
-      buttons: [
-        {
-          buttonId: `ACCEPT_${code}`,
-          buttonText: { displayText: "✅ Connect Now" },
-          type: 1,
-        },
-      ],
-      headerType: 1,
-    });
+await sendFn(cand.user_id, {
+  text: `👋 Hi ${cand.name || "student"}!\nA nearby student wants to connect${
+    topic ? " about *" + topic + "*" : ""
+  }.\nDistance: ~${Math.round(cand.distance_km)} km.`,
+  templateButtons: [
+    {
+      index: 1,
+      quickReplyButton: {
+        displayText: "✅ Connect Now",
+        id: `ACCEPT_${code}`
+      },
+    },
+  ],
+  footer: "Press to accept",
+});
+
   }
 
   return `✅ I’ve invited a few nearby students${topic ? " about *" + topic + "*" : ""}. If someone accepts, I’ll share their contact with you.`;
