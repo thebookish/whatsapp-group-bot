@@ -230,7 +230,7 @@ async function getAIResponse(userId, rawMessage) {
         : rawMessage;
     if (typeof messageText !== "string") messageText = "";
 
-    // Location handling
+    // 📍 Location handling
     const locMsg = rawMessage?.message?.locationMessage;
     if (!messageText.trim()) {
       if (
@@ -253,7 +253,7 @@ async function getAIResponse(userId, rawMessage) {
       } else return "Text only please 🙂";
     }
 
-    // Profile load
+    // 🗂 Profile load
     const { exists, user } = await checkUserExists(uid);
     let profile;
     if (activeSessions.has(uid)) profile = activeSessions.get(uid);
@@ -275,19 +275,18 @@ async function getAIResponse(userId, rawMessage) {
       activeSessions.set(uid, profile);
     }
 
-    // ✅ Greeting check before tool call
+    // 👋 Greeting check
     if (/^(hello|hi|hey)\b/i.test(messageText)) {
       if (profile.name && profile.onboardingStep === ONBOARDING_STEPS.COMPLETE) {
         return `Hey ${profile.name} 👋 How can I help you?`;
       } else {
-        // fallback to onboarding if no name yet
         if (profile.onboardingStep === ONBOARDING_STEPS.NAME) {
           return `Hey! I’m your study buddy. What’s your name?`;
         }
       }
     }
 
-    // ===== Call LLM with tool options =====
+    // 🤖 LLM call with tools
     const res = await axios.post(
       "https://openrouter.ai/api/v1/chat/completions",
       {
@@ -367,45 +366,58 @@ async function getAIResponse(userId, rawMessage) {
     const choice = res.data?.choices?.[0];
     const toolCalls = choice?.message?.tool_calls;
 
+    // 🛠 Handle tool calls
     if (toolCalls && toolCalls.length) {
       for (const call of toolCalls) {
-        const args = JSON.parse(call.function?.arguments || "{}");
+        try {
+          const args = call.function?.arguments
+            ? JSON.parse(call.function.arguments)
+            : {};
 
-        if (call.function?.name === "queryDataset") {
-          const result = await queryDataset(args.query, { max: 200 });
-          if (result?.rows?.length) {
-            profile.lastRows = result.rows;
-            profile.lastOffset = Math.min(5, result.rows.length);
-            return formatCourseSlice(result.rows, 0, 5, result.text || "");
+          switch (call.function?.name) {
+            case "queryDataset": {
+              const result = await queryDataset(args.query, { max: 200 });
+              if (result?.rows?.length) {
+                profile.lastRows = result.rows;
+                profile.lastOffset = Math.min(5, result.rows.length);
+                return formatCourseSlice(result.rows, 0, 5, result.text || "");
+              }
+              return "No matching courses found.";
+            }
+
+            case "searchUKAccommodation": {
+              const { listings } = await searchUKAccommodation(args);
+              return formatAccommodationReply(listings);
+            }
+
+            case "addReminder": {
+              await addReminder(uid, args.task, new Date(args.datetime));
+              return `✅ Reminder set for "${args.task}" at ${new Date(
+                args.datetime
+              ).toLocaleString()}`;
+            }
+
+            case "handleConnectIntent": {
+              return await handleConnectIntent({ requesterId: uid, ...args });
+            }
+
+            default:
+              return "❌ I didn’t understand the tool request.";
           }
-          return "No matching courses found.";
-        }
-
-        if (call.function?.name === "searchUKAccommodation") {
-          const { listings } = await searchUKAccommodation(args);
-          return formatAccommodationReply(listings);
-        }
-
-        if (call.function?.name === "addReminder") {
-          await addReminder(uid, args.task, new Date(args.datetime));
-          return `✅ Reminder set for "${args.task}" at ${new Date(
-            args.datetime
-          ).toLocaleString()}`;
-        }
-
-        if (call.function?.name === "handleConnectIntent") {
-          return await handleConnectIntent({ requesterId: uid, ...args });
+        } catch (err) {
+          console.error("❌ Tool call error:", err);
+          return "Sorry, I couldn’t process that request.";
         }
       }
     }
 
-    // Accept handling (manual since buttons send text)
+    // ✅ Accept handling (manual input)
     if (ACCEPT_PAT.test(messageText)) {
       const m = messageText.match(ACCEPT_PAT);
       if (m) return await handleAcceptCode(uid, m[1]);
     }
 
-    // Onboarding
+    // 👨‍🎓 Onboarding
     if (profile.onboardingStep !== ONBOARDING_STEPS.COMPLETE) {
       switch (profile.onboardingStep) {
         case ONBOARDING_STEPS.NAME: {
@@ -438,7 +450,7 @@ async function getAIResponse(userId, rawMessage) {
       }
     }
 
-    // Pagination
+    // 📜 Pagination
     if (
       MORE_PATTERNS.test(messageText) &&
       Array.isArray(profile.lastRows) &&
@@ -456,6 +468,7 @@ async function getAIResponse(userId, rawMessage) {
     return "Sorry, something went wrong.";
   }
 }
+
 
 
 /* ============================
