@@ -74,10 +74,9 @@ async function querySupabaseCourses(question, k = 50) {
 function summarizeRows(rows, limit = 10) {
   return rows
     .slice(0, limit)
-    .filter((r) => r.title && r.title.trim().length > 0) // 🔥 skip rows with no title
+    .filter((r) => r.title && r.title.trim().length > 1) // 🚫 drop rows with no title
     .map((r) => {
-      const title = r.title;
-      // const qual = r.qualification ? `Qualification: ${r.qualification}` : null;
+      const title = r.title.trim();
       const campus = r.campus ? `Campus: ${r.campus}` : null;
       const start = r.start_date ? `Start: ${r.start_date}` : null;
       const app = r.metadata?.applicationCode
@@ -89,7 +88,6 @@ function summarizeRows(rows, limit = 10) {
 
       return [
         `• ${title}`,
-        // qual,
         campus,
         start,
         app,
@@ -101,13 +99,12 @@ function summarizeRows(rows, limit = 10) {
     .join("\n\n");
 }
 
-
-
 function buildRAGContext(records = []) {
   return records
+    .filter((r) => r.title && r.title.trim().length > 1) // 🚫 drop empty ones
     .map((r, i) => {
       return [
-        `#${i + 1} ${r.title || "Course"}`,
+        `#${i + 1} ${r.title.trim()}`,
         r.qualification ? `Qualification: ${r.qualification}` : null,
         r.start_date ? `Start: ${r.start_date}` : null,
         r.metadata?.applicationCode ? `Code: ${r.metadata.applicationCode}` : null,
@@ -119,6 +116,7 @@ function buildRAGContext(records = []) {
     })
     .join("\n");
 }
+
 
 function sanitizeLLMReply(s) {
   if (!s || typeof s !== "string") return "";
