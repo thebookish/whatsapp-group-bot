@@ -1,35 +1,35 @@
-// vectorstore.js
-const fs = require('fs');
-const axios = require('axios');
-const { supabase, DATA_FILE, OPENROUTER_API_KEY } = require('./config');
+const fs = require("fs");
+const { supabase, DATA_FILE, OPENROUTER_API_KEY } = require("./config");
+const OpenAI = require("openai");
 
-/** Batch embeddings from OpenRouter */
+/* ============================
+   OpenAI Client
+============================= */
+const openai = new OpenAI({
+  apiKey: OPENROUTER_API_KEY, // using same env variable
+});
+
+/* ============================
+   Batch embeddings
+============================= */
 async function getEmbeddingsBatch(texts) {
   try {
-    const res = await axios.post(
-      "https://openrouter.ai/api/v1/embeddings",
-      {
-        model: "openai/text-embedding-3-small",
-        input: texts
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        timeout: 30000
-      }
-    );
-    return res.data?.data?.map(d => d.embedding) || [];
+    const res = await openai.embeddings.create({
+      model: "text-embedding-3-small",
+      input: texts,
+    });
+    return res.data.map((d) => d.embedding);
   } catch (err) {
-    console.error("Embedding API error:", err.response?.data || err.message);
+    console.error("Embedding API error:", err.message || err);
     return texts.map(() => []);
   }
 }
 
-/** Build vector store in Supabase */
+/* ============================
+   Build vector store in Supabase
+============================= */
 async function buildVectorStore() {
-  const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+  const parsed = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
 
   // Normalize dataset shape
   let raw;
@@ -37,7 +37,7 @@ async function buildVectorStore() {
     raw = parsed;
   } else if (parsed.records && Array.isArray(parsed.records)) {
     raw = parsed.records;
-  } else if (typeof parsed === 'object') {
+  } else if (typeof parsed === "object") {
     raw = Object.values(parsed);
   } else {
     throw new Error("Dataset format not recognized.");
@@ -46,7 +46,9 @@ async function buildVectorStore() {
   console.log(`📦 Found ${raw.length} providers in dataset`);
 
   // Skip if already built
-  const { count } = await supabase.from('course_vectors').select('*', { count: 'exact', head: true });
+  const { count } = await supabase
+    .from("course_vectors")
+    .select("*", { count: "exact", head: true });
   if (count > 0) {
     console.log(`⚡ Skipping build — DB already has ${count} rows`);
     return;
@@ -59,18 +61,18 @@ async function buildVectorStore() {
   for (const [pi, provider] of raw.entries()) {
     for (const course of provider.courses || []) {
       for (const option of course.options || [null]) {
-        const text = `${course.courseTitle || ''} ${course.outcomeQualification?.caption || ''} ${option?.location?.name || ''} ${option?.startDate?.date || ''}`;
+        const text = `${course.courseTitle || ""} ${course.outcomeQualification?.caption || ""} ${option?.location?.name || ""} ${option?.startDate?.date || ""}`;
 
         texts.push(text);
         meta.push({
-          title: course.courseTitle || '',
-          qualification: course.outcomeQualification?.caption || '',
-          campus: option?.location?.name || '',
-          start_date: option?.startDate?.date || '',
+          title: course.courseTitle || "",
+          qualification: course.outcomeQualification?.caption || "",
+          campus: option?.location?.name || "",
+          start_date: option?.startDate?.date || "",
           metadata: {
             provider: provider.name,
-            applicationCode: course.applicationCode || ''
-          }
+            applicationCode: course.applicationCode || "",
+          },
         });
 
         // Process in batches of 50
@@ -93,27 +95,31 @@ async function buildVectorStore() {
   console.log(`🎉 Vector store built with ${processed} rows`);
 }
 
-/** Insert batch into Supabase */
+/* ============================
+   Insert batch into Supabase
+============================= */
 async function embedAndInsert(texts, meta) {
   const vectors = await getEmbeddingsBatch(texts);
   const rows = vectors.map((vec, i) => ({
     ...meta[i],
-    embedding: vec
+    embedding: vec,
   }));
 
-  const { error } = await supabase.from('course_vectors').insert(rows);
+  const { error } = await supabase.from("course_vectors").insert(rows);
   if (error) console.error("Insert error:", error);
 }
 
-/** Query top-k similar courses */
+/* ============================
+   Query top-k similar courses
+============================= */
 async function queryCourses(userQuery, k = 10) {
   const vectors = await getEmbeddingsBatch([userQuery]);
   const queryVec = vectors[0];
   if (!queryVec?.length) return [];
 
-  const { data, error } = await supabase.rpc('match_courses', {
+  const { data, error } = await supabase.rpc("match_courses", {
     query_embedding: queryVec,
-    match_count: k
+    match_count: k,
   });
 
   if (error) {
@@ -124,4 +130,3 @@ async function queryCourses(userQuery, k = 10) {
 }
 
 module.exports = { buildVectorStore, queryCourses, getEmbeddingsBatch };
-
