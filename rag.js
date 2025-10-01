@@ -1,5 +1,6 @@
+// rag.js
 const { supabase } = require("./config");
-const { getEmbeddingsBatch } = require("./vectorstore"); // now powered by OpenAI
+const { getEmbeddingsBatch } = require("./vectorstore");
 
 /** =========================
  *  Helpers
@@ -44,7 +45,6 @@ function isCourseLike(query) {
   if (COURSE_HINTS.some((k) => s.includes(k))) return true;
   if (/\b(bsc|ba|msc|ma|mba|phd)\b/.test(s)) return true;
   if (/\b(course|degree|program(me)?)\b/.test(s)) return true;
-  if (/\b(computer science|data science|engineering|business|law|medicine|nursing|psychology|accounting|finance)\b.*\b(course|degree|msc|bsc|ba)\b/.test(s)) return true;
   return false;
 }
 
@@ -132,28 +132,20 @@ async function queryDataset(question, opts = {}) {
     };
   }
 
-  let rows = await querySupabaseCourses(question, opts.max || 50);
-
-  // ✅ Fallback: simplify query if no results
-  if (!rows.length) {
-    const simpler = question.replace(/\bin\s+[A-Za-z\s]+$/i, "").trim();
-    if (simpler !== question) {
-      rows = await querySupabaseCourses(simpler, opts.max || 50);
-    }
-  }
+  const rows = await querySupabaseCourses(question, opts.max || 50);
 
   if (!rows.length) {
-    return { intent: "LIST", count: 0, rows: [], text: "No matches found in dataset." };
+    return { intent: "LIST", count: 0, rows: [], text: "No matches found in dataset.", context: "" };
   }
 
   const intent = detectIntent(question);
+  const context = buildRAGContext(rows);
 
   if (intent === "COUNT") {
-    return { intent, count: rows.length, rows, text: `Found ${rows.length} courses.` };
+    return { intent, count: rows.length, rows, text: `Found ${rows.length} courses.`, context };
   }
 
   if (intent === "AVG" || intent === "MIN" || intent === "MAX") {
-    // simple fee/duration handling
     const fieldCandidates = ["tuition_fee", "fee", "fees", "price", "cost", "duration"];
     const nums = rows
       .map((r) => {
@@ -167,24 +159,24 @@ async function queryDataset(question, opts = {}) {
       .filter(Boolean);
 
     if (!nums.length) {
-      return { intent: "LIST", rows, text: summarizeRows(rows, 5) };
+      return { intent: "LIST", rows, text: summarizeRows(rows, 5), context };
     }
 
     if (intent === "AVG") {
       const avg = nums.reduce((a, b) => a + parseFloat(b.val), 0) / nums.length;
-      return { intent, value: avg, rows, text: `Average ${nums[0].field}: ${avg}` };
+      return { intent, value: avg, rows, text: `Average ${nums[0].field}: ${avg}`, context };
     }
     if (intent === "MIN") {
       const best = nums.reduce((a, b) => (parseFloat(a.val) < parseFloat(b.val) ? a : b));
-      return { intent, value: best.val, rows, text: `Lowest ${best.field}: ${best.val} — ${best.title}` };
+      return { intent, value: best.val, rows, text: `Lowest ${best.field}: ${best.val} — ${best.title}`, context };
     }
     if (intent === "MAX") {
       const best = nums.reduce((a, b) => (parseFloat(a.val) > parseFloat(b.val) ? a : b));
-      return { intent, value: best.val, rows, text: `Highest ${best.field}: ${best.val} — ${best.title}` };
+      return { intent, value: best.val, rows, text: `Highest ${best.field}: ${best.val} — ${best.title}`, context };
     }
   }
 
-  return { intent: "LIST", rows, text: summarizeRows(rows, 5) };
+  return { intent: "LIST", rows, text: summarizeRows(rows, 5), context };
 }
 
 /** =========================

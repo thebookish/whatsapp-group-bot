@@ -1,3 +1,4 @@
+// vectorstore.js
 const fs = require("fs");
 const { supabase, DATA_FILE, OPENROUTER_API_KEY } = require("./config");
 const OpenAI = require("openai");
@@ -6,7 +7,7 @@ const OpenAI = require("openai");
    OpenAI Client
 ============================= */
 const openai = new OpenAI({
-  apiKey: OPENROUTER_API_KEY, // using same env variable
+  apiKey: OPENROUTER_API_KEY, // keep same env variable
 });
 
 /* ============================
@@ -81,7 +82,9 @@ async function buildVectorStore() {
           processed += texts.length;
           texts = [];
           meta = [];
-          console.log(`✅ Processed ${processed} courses (provider ${pi + 1}/${raw.length})`);
+          console.log(
+            `✅ Processed ${processed} courses (provider ${pi + 1}/${raw.length})`
+          );
         }
       }
     }
