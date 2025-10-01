@@ -230,14 +230,10 @@ async function getAIResponse(userId, rawMessage) {
         : rawMessage;
     if (typeof messageText !== "string") messageText = "";
 
-    // 📍 Location handling
+    // Handle location share
     const locMsg = rawMessage?.message?.locationMessage;
     if (!messageText.trim()) {
-      if (
-        locMsg &&
-        typeof locMsg.degreesLatitude === "number" &&
-        typeof locMsg.degreesLongitude === "number"
-      ) {
+      if (locMsg && typeof locMsg.degreesLatitude === "number" && typeof locMsg.degreesLongitude === "number") {
         try {
           await upsertUserLocation(uid, {
             lat: locMsg.degreesLatitude,
@@ -253,7 +249,7 @@ async function getAIResponse(userId, rawMessage) {
       } else return "Text only please 🙂";
     }
 
-    // 🗂 Profile load
+    // Load user profile
     const { exists, user } = await checkUserExists(uid);
     let profile;
     if (activeSessions.has(uid)) profile = activeSessions.get(uid);
@@ -267,207 +263,121 @@ async function getAIResponse(userId, rawMessage) {
         lastOffset: 0,
       };
       activeSessions.set(uid, profile);
-      try {
-        await updateUserInDB(uid, {});
-      } catch {}
+      try { await updateUserInDB(uid, {}); } catch {}
     } else {
       profile = createUserProfile();
       activeSessions.set(uid, profile);
     }
 
-    // 👋 Greeting check
-    if (/^(hello|hi|hey)\b/i.test(messageText)) {
+    messageText = validateMessage(messageText);
+
+    // ========== INTENT DETECTION ==========
+    const intent = detectIntent(messageText);
+    console.log("👉 Detected intent:", intent, "for:", messageText);
+
+    // ----- Greeting -----
+    if (intent === "greeting") {
       if (profile.name && profile.onboardingStep === ONBOARDING_STEPS.COMPLETE) {
         return `Hey ${profile.name} 👋 How can I help you?`;
       } else {
-        if (profile.onboardingStep === ONBOARDING_STEPS.NAME) {
-          return `Hey! I’m your study buddy. What’s your name?`;
-        }
+        return `Hey! I’m your study buddy. What’s your name?`;
       }
     }
 
-    // 🤖 LLM call with tools
-    const res = await axios.post(
-      "https://openrouter.ai/api/v1/chat/completions",
-      {
-        model: "mistralai/mistral-7b-instruct",
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are a Student Assistant. Use tools, not generic answers. Courses/unis → queryDataset. Housing → searchUKAccommodation. Reminders → addReminder. Connect → handleConnectIntent. Always prefer calling a tool.",
-          },
-          { role: "user", content: messageText },
-        ],
-        tools: [
-          {
-            type: "function",
-            function: {
-              name: "queryDataset",
-              description: "Get university or course info",
-              parameters: {
-                type: "object",
-                properties: { query: { type: "string" } },
-                required: ["query"],
-              },
-            },
-          },
-          {
-            type: "function",
-            function: {
-              name: "searchUKAccommodation",
-              description: "Find UK student accommodation",
-              parameters: {
-                type: "object",
-                properties: {
-                  place_name: { type: "string" },
-                  price_max: { type: "number" },
-                  bedrooms: { type: "number" },
-                },
-              },
-            },
-          },
-          {
-            type: "function",
-            function: {
-              name: "addReminder",
-              description: "Set a reminder",
-              parameters: {
-                type: "object",
-                properties: {
-                  task: { type: "string" },
-                  datetime: { type: "string", format: "date-time" },
-                },
-                required: ["task", "datetime"],
-              },
-            },
-          },
-          {
-            type: "function",
-            function: {
-              name: "handleConnectIntent",
-              description: "Connect nearby students",
-              parameters: {
-                type: "object",
-                properties: {
-                  topic: { type: "string" },
-                  radiusKm: { type: "number" },
-                },
-              },
-            },
-          },
-        ],
-        temperature: 0,
-        max_tokens: 200,
-      },
-      { headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}` } }
-    );
-
-    const choice = res.data?.choices?.[0];
-    const toolCalls = choice?.message?.tool_calls;
-
-    // 🛠 Handle tool calls
-    if (toolCalls && toolCalls.length) {
-      for (const call of toolCalls) {
-        try {
-          const args = call.function?.arguments
-            ? JSON.parse(call.function.arguments)
-            : {};
-
-          switch (call.function?.name) {
-            case "queryDataset": {
-              const result = await queryDataset(args.query, { max: 200 });
-              if (result?.rows?.length) {
-                profile.lastRows = result.rows;
-                profile.lastOffset = Math.min(5, result.rows.length);
-                return formatCourseSlice(result.rows, 0, 5, result.text || "");
-              }
-              return "No matching courses found.";
-            }
-
-            case "searchUKAccommodation": {
-              const { listings } = await searchUKAccommodation(args);
-              return formatAccommodationReply(listings);
-            }
-
-            case "addReminder": {
-              await addReminder(uid, args.task, new Date(args.datetime));
-              return `✅ Reminder set for "${args.task}" at ${new Date(
-                args.datetime
-              ).toLocaleString()}`;
-            }
-
-            case "handleConnectIntent": {
-              return await handleConnectIntent({ requesterId: uid, ...args });
-            }
-
-            default:
-              return "❌ I didn’t understand the tool request.";
-          }
-        } catch (err) {
-          console.error("❌ Tool call error:", err);
-          return "Sorry, I couldn’t process that request.";
-        }
-      }
+    // ----- Reminder -----
+    if (intent === "reminder") {
+      return await handleReminder(uid, messageText);
     }
 
-    // ✅ Accept handling (manual input)
-    if (ACCEPT_PAT.test(messageText)) {
+    // ----- Accept code -----
+    if (intent === "accept") {
       const m = messageText.match(ACCEPT_PAT);
       if (m) return await handleAcceptCode(uid, m[1]);
     }
 
-    // 👨‍🎓 Onboarding
-    if (profile.onboardingStep !== ONBOARDING_STEPS.COMPLETE) {
-      switch (profile.onboardingStep) {
-        case ONBOARDING_STEPS.NAME: {
-          const name = extractNameFromText(messageText);
-          if (!name)
-            return `All good—tell me your name (e.g., "I'm Nabil Hasan").`;
-          profile.name = name;
-          profile.onboardingStep = ONBOARDING_STEPS.INTERESTS;
-          return `Nice to meet you, ${profile.name}! What subjects/fields are you into?`;
-        }
-        case ONBOARDING_STEPS.INTERESTS:
-          profile.interests = messageText;
-          profile.onboardingStep = ONBOARDING_STEPS.GOALS;
-          return `Got it. Your main goal—scholarship, admission, job?`;
-        case ONBOARDING_STEPS.GOALS:
-          profile.goals = messageText;
-          profile.onboardingStep = ONBOARDING_STEPS.COUNTRY;
-          return `Cool. Which country are you in / targeting?`;
-        case ONBOARDING_STEPS.COUNTRY:
-          profile.country = messageText;
-          profile.onboardingStep = ONBOARDING_STEPS.COMPLETE;
-          try {
-            await createUserInDB(uid, profile);
-          } catch {
-            try {
-              await updateUserInDB(uid, profile);
-            } catch {}
-          }
-          return `Profile saved ✅ Ask me anything about courses, unis, or apps.`;
+    // ----- Connect intent -----
+    if (intent === "connect") {
+      let topic = "";
+      const topicMatch = messageText.match(/\b(?:about|for|doing|interested in)\s+(.{3,60})$/i);
+      if (topicMatch) topic = topicMatch[1].trim();
+
+      // Check for city mention in text (e.g. "I am in Sylhet")
+      const cityMatch = messageText.match(/\b(?:in|at|from)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)/);
+      if (cityMatch) {
+        try {
+          await upsertUserLocation(uid, { city: cityMatch[1], discoverable: true, radiusKm: 10 });
+          return `📍 Got your city as ${cityMatch[1]}. You’re now discoverable to nearby students!`;
+        } catch {}
       }
+
+      return await handleConnectIntent({ requesterId: uid, topic, radiusKm: 10 });
     }
 
-    // 📜 Pagination
-    if (
-      MORE_PATTERNS.test(messageText) &&
-      Array.isArray(profile.lastRows) &&
-      profile.lastRows.length
-    ) {
+    // ----- Accommodation intent -----
+    if (intent === "accommodation") {
+      const prefs = parseAccommodationQuery(messageText);
+      if (!prefs.place_name)
+        return `Tell me the city/area + budget, e.g. "1 bed under £900 in Manchester".`;
+      const { listings } = await searchUKAccommodation(prefs);
+      return formatAccommodationReply(listings);
+    }
+
+    // ----- Course queries (force dataset) -----
+    if (/course|university|uni/i.test(messageText)) {
+      const datasetResult = await queryDataset(messageText, { max: 200 });
+      if (datasetResult?.rows?.length) {
+        profile.lastRows = datasetResult.rows;
+        profile.lastOffset = Math.min(5, datasetResult.rows.length);
+        return formatCourseSlice(datasetResult.rows, 0, 5, datasetResult.text || "");
+      }
+      return "No matching courses found.";
+    }
+
+    // ----- Pagination -----
+    if (MORE_PATTERNS.test(messageText) && Array.isArray(profile.lastRows) && profile.lastRows.length) {
       const start = profile.lastOffset || 0;
       const reply = formatCourseSlice(profile.lastRows, start, 5);
       profile.lastOffset = Math.min(start + 5, profile.lastRows.length);
       return reply;
     }
 
-    return choice?.message?.content || "Sorry, I couldn’t process that.";
+    // ----- Onboarding flow -----
+    if (profile.onboardingStep !== ONBOARDING_STEPS.COMPLETE) {
+      switch (profile.onboardingStep) {
+        case ONBOARDING_STEPS.NAME:
+          const name = extractNameFromText(messageText);
+          if (!name) return `All good—tell me your name (e.g., "I'm Nabil Hasan").`;
+          profile.name = name;
+          profile.onboardingStep = ONBOARDING_STEPS.INTERESTS;
+          return `Nice to meet you, ${profile.name}! What subjects/fields are you into?`;
+
+        case ONBOARDING_STEPS.INTERESTS:
+          profile.interests = messageText;
+          profile.onboardingStep = ONBOARDING_STEPS.GOALS;
+          return `Got it. Your main goal—scholarship, admission, job?`;
+
+        case ONBOARDING_STEPS.GOALS:
+          profile.goals = messageText;
+          profile.onboardingStep = ONBOARDING_STEPS.COUNTRY;
+          return `Cool. Which country are you in / targeting?`;
+
+        case ONBOARDING_STEPS.COUNTRY:
+          profile.country = messageText;
+          profile.onboardingStep = ONBOARDING_STEPS.COMPLETE;
+          try { await createUserInDB(uid, profile); } catch { try { await updateUserInDB(uid, profile); } catch {} }
+          return `Profile saved ✅ Ask me anything about courses, unis, or apps.`;
+      }
+    }
+
+    // ----- Fallback to LLM for chit-chat -----
+    return await generateAIResponse(profile, messageText, profile.conversationHistory, "");
+
   } catch (error) {
     console.error("getAIResponse error:", error);
     return "Sorry, something went wrong.";
   }
 }
+
 
 
 
