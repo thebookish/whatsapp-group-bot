@@ -233,7 +233,11 @@ async function getAIResponse(userId, rawMessage) {
     // Location handling
     const locMsg = rawMessage?.message?.locationMessage;
     if (!messageText.trim()) {
-      if (locMsg && typeof locMsg.degreesLatitude === "number" && typeof locMsg.degreesLongitude === "number") {
+      if (
+        locMsg &&
+        typeof locMsg.degreesLatitude === "number" &&
+        typeof locMsg.degreesLongitude === "number"
+      ) {
         try {
           await upsertUserLocation(uid, {
             lat: locMsg.degreesLatitude,
@@ -263,98 +267,111 @@ async function getAIResponse(userId, rawMessage) {
         lastOffset: 0,
       };
       activeSessions.set(uid, profile);
-      try { await updateUserInDB(uid, {}); } catch {}
+      try {
+        await updateUserInDB(uid, {});
+      } catch {}
     } else {
       profile = createUserProfile();
       activeSessions.set(uid, profile);
     }
 
-    // Call LLM with tool options
-    const res = await axios.post("https://openrouter.ai/api/v1/chat/completions", {
-      
-  "model": "mistralai/mistral-7b-instruct",
-  "messages": [
-    {
-      "role": "system",
-      "content": "You are a Student Assistant. Use tools, not generic answers. Courses/unis → queryDataset. Housing → searchUKAccommodation. Reminders → addReminder. Connect → handleConnectIntent. Always prefer calling a tool."
-    },
-    {
-      "role": "user",
-      "content": "Find me computer science courses in London"
-    }
-  ],
-  "tools": [
-    {
-      "type": "function",
-      "function": {
-        "name": "queryDataset",
-        "description": "Get university or course info",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "query": { "type": "string" }
-          },
-          "required": ["query"]
-        }
-      }
-    },
-    {
-      "type": "function",
-      "function": {
-        "name": "searchUKAccommodation",
-        "description": "Find UK student accommodation",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "place_name": { "type": "string" },
-            "price_max": { "type": "number" },
-            "bedrooms": { "type": "number" }
-          }
-        }
-      }
-    },
-    {
-      "type": "function",
-      "function": {
-        "name": "addReminder",
-        "description": "Set a reminder",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "task": { "type": "string" },
-            "datetime": { "type": "string", "format": "date-time" }
-          },
-          "required": ["task", "datetime"]
-        }
-      }
-    },
-    {
-      "type": "function",
-      "function": {
-        "name": "handleConnectIntent",
-        "description": "Connect nearby students",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "topic": { "type": "string" },
-            "radiusKm": { "type": "number" }
-          }
+    // ✅ Greeting check before tool call
+    if (/^(hello|hi|hey)\b/i.test(messageText)) {
+      if (profile.name && profile.onboardingStep === ONBOARDING_STEPS.COMPLETE) {
+        return `Hey ${profile.name} 👋 How can I help you?`;
+      } else {
+        // fallback to onboarding if no name yet
+        if (profile.onboardingStep === ONBOARDING_STEPS.NAME) {
+          return `Hey! I’m your study buddy. What’s your name?`;
         }
       }
     }
-  ],
-  "temperature": 0,
-  "max_tokens": 200
-}
-, { headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}` } });
+
+    // ===== Call LLM with tool options =====
+    const res = await axios.post(
+      "https://openrouter.ai/api/v1/chat/completions",
+      {
+        model: "mistralai/mistral-7b-instruct",
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a Student Assistant. Use tools, not generic answers. Courses/unis → queryDataset. Housing → searchUKAccommodation. Reminders → addReminder. Connect → handleConnectIntent. Always prefer calling a tool.",
+          },
+          { role: "user", content: messageText },
+        ],
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "queryDataset",
+              description: "Get university or course info",
+              parameters: {
+                type: "object",
+                properties: { query: { type: "string" } },
+                required: ["query"],
+              },
+            },
+          },
+          {
+            type: "function",
+            function: {
+              name: "searchUKAccommodation",
+              description: "Find UK student accommodation",
+              parameters: {
+                type: "object",
+                properties: {
+                  place_name: { type: "string" },
+                  price_max: { type: "number" },
+                  bedrooms: { type: "number" },
+                },
+              },
+            },
+          },
+          {
+            type: "function",
+            function: {
+              name: "addReminder",
+              description: "Set a reminder",
+              parameters: {
+                type: "object",
+                properties: {
+                  task: { type: "string" },
+                  datetime: { type: "string", format: "date-time" },
+                },
+                required: ["task", "datetime"],
+              },
+            },
+          },
+          {
+            type: "function",
+            function: {
+              name: "handleConnectIntent",
+              description: "Connect nearby students",
+              parameters: {
+                type: "object",
+                properties: {
+                  topic: { type: "string" },
+                  radiusKm: { type: "number" },
+                },
+              },
+            },
+          },
+        ],
+        temperature: 0,
+        max_tokens: 200,
+      },
+      { headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}` } }
+    );
 
     const choice = res.data?.choices?.[0];
     const toolCalls = choice?.message?.tool_calls;
 
     if (toolCalls && toolCalls.length) {
       for (const call of toolCalls) {
-        const args = JSON.parse(call.arguments || "{}");
-        if (call.name === "queryDataset") {
+        const args = JSON.parse(call.function?.arguments || "{}");
+
+        if (call.function?.name === "queryDataset") {
           const result = await queryDataset(args.query, { max: 200 });
           if (result?.rows?.length) {
             profile.lastRows = result.rows;
@@ -363,15 +380,20 @@ async function getAIResponse(userId, rawMessage) {
           }
           return "No matching courses found.";
         }
-        if (call.name === "searchUKAccommodation") {
+
+        if (call.function?.name === "searchUKAccommodation") {
           const { listings } = await searchUKAccommodation(args);
           return formatAccommodationReply(listings);
         }
-        if (call.name === "addReminder") {
+
+        if (call.function?.name === "addReminder") {
           await addReminder(uid, args.task, new Date(args.datetime));
-          return `✅ Reminder set for "${args.task}" at ${new Date(args.datetime).toLocaleString()}`;
+          return `✅ Reminder set for "${args.task}" at ${new Date(
+            args.datetime
+          ).toLocaleString()}`;
         }
-        if (call.name === "handleConnectIntent") {
+
+        if (call.function?.name === "handleConnectIntent") {
           return await handleConnectIntent({ requesterId: uid, ...args });
         }
       }
@@ -386,27 +408,42 @@ async function getAIResponse(userId, rawMessage) {
     // Onboarding
     if (profile.onboardingStep !== ONBOARDING_STEPS.COMPLETE) {
       switch (profile.onboardingStep) {
-        case ONBOARDING_STEPS.NAME:
-          if (isGreetingOnly(messageText)) return `Hey! I’m your study buddy. What’s your name?`;
+        case ONBOARDING_STEPS.NAME: {
           const name = extractNameFromText(messageText);
-          if (!name) return `All good—tell me your name (e.g., "I'm Nabil Hasan").`;
-          profile.name = name; profile.onboardingStep = ONBOARDING_STEPS.INTERESTS;
+          if (!name)
+            return `All good—tell me your name (e.g., "I'm Nabil Hasan").`;
+          profile.name = name;
+          profile.onboardingStep = ONBOARDING_STEPS.INTERESTS;
           return `Nice to meet you, ${profile.name}! What subjects/fields are you into?`;
+        }
         case ONBOARDING_STEPS.INTERESTS:
-          profile.interests = messageText; profile.onboardingStep = ONBOARDING_STEPS.GOALS;
+          profile.interests = messageText;
+          profile.onboardingStep = ONBOARDING_STEPS.GOALS;
           return `Got it. Your main goal—scholarship, admission, job?`;
         case ONBOARDING_STEPS.GOALS:
-          profile.goals = messageText; profile.onboardingStep = ONBOARDING_STEPS.COUNTRY;
+          profile.goals = messageText;
+          profile.onboardingStep = ONBOARDING_STEPS.COUNTRY;
           return `Cool. Which country are you in / targeting?`;
         case ONBOARDING_STEPS.COUNTRY:
-          profile.country = messageText; profile.onboardingStep = ONBOARDING_STEPS.COMPLETE;
-          try { await createUserInDB(uid, profile); } catch { try { await updateUserInDB(uid, profile); } catch {} }
+          profile.country = messageText;
+          profile.onboardingStep = ONBOARDING_STEPS.COMPLETE;
+          try {
+            await createUserInDB(uid, profile);
+          } catch {
+            try {
+              await updateUserInDB(uid, profile);
+            } catch {}
+          }
           return `Profile saved ✅ Ask me anything about courses, unis, or apps.`;
       }
     }
 
     // Pagination
-    if (MORE_PATTERNS.test(messageText) && Array.isArray(profile.lastRows) && profile.lastRows.length) {
+    if (
+      MORE_PATTERNS.test(messageText) &&
+      Array.isArray(profile.lastRows) &&
+      profile.lastRows.length
+    ) {
       const start = profile.lastOffset || 0;
       const reply = formatCourseSlice(profile.lastRows, start, 5);
       profile.lastOffset = Math.min(start + 5, profile.lastRows.length);
@@ -419,6 +456,7 @@ async function getAIResponse(userId, rawMessage) {
     return "Sorry, something went wrong.";
   }
 }
+
 
 /* ============================
    Exports
