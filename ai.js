@@ -296,7 +296,7 @@ async function getAIResponse(userId, rawMessage) {
 
     // 🤖 LLM call with tools
     const res = await openai.chat.completions.create({
-      model: "gpt-4.0-mini",
+      model: "gpt-4o-mini",
       messages: [
         {
           role: "system",
