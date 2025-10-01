@@ -71,7 +71,7 @@ async function querySupabaseCourses(question, k = 50) {
 /** =========================
  *  Summaries + Context
  *  ========================= */
-function summarizeRows(rows, limit = 10) {
+function summarizeRows(rows, limit = 5) {
   return rows
     .slice(0, limit)
     .filter((r) => r.title && r.title.trim().length > 1) // 🚫 drop rows with no title
