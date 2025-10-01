@@ -74,26 +74,32 @@ async function querySupabaseCourses(question, k = 50) {
 function summarizeRows(rows, limit = 10) {
   return rows
     .slice(0, limit)
-    .map((r) => {
-      const title = r.title || "";
-      const qual = r.qualification || "";
-      const campus = r.campus || "";
-      const start = r.start_date || "";
-      const app = r.metadata?.applicationCode || "";
-      const provider = r.metadata?.provider || "";
+    .map((r, i) => {
+      const title = r.title || "Course";
+      // const qual = r.qualification ? `Qualification: ${r.qualification}` : null;
+      const campus = r.campus ? `Campus: ${r.campus}` : null;
+      const start = r.start_date ? `Start: ${r.start_date}` : null;
+      const app = r.metadata?.applicationCode
+        ? `Application Code: ${r.metadata.applicationCode}`
+        : null;
+      const provider = r.metadata?.provider
+        ? `Provider: ${r.metadata.provider}`
+        : null;
+
       return [
-        title || "Course",
-        qual ? `(${qual})` : null,
-        campus ? `Campus: ${campus}` : null,
-        start ? `Start: ${start}` : null,
-        app ? `Code: ${app}` : null,
-        provider ? `Provider: ${provider}` : null,
+        `• ${title}`,       // course title as bullet
+        // qual,
+        campus,
+        start,
+        app,
+        provider,
       ]
         .filter(Boolean)
-        .join(" | ");
+        .join("\n  "); // indent details
     })
-    .join("\n");
+    .join("\n\n"); // blank line between courses
 }
+
 
 function buildRAGContext(records = []) {
   return records

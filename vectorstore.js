@@ -21,10 +21,11 @@ async function getEmbeddingsBatch(texts) {
     });
     return res.data.map((d) => d.embedding);
   } catch (err) {
-    console.error("Embedding API error:", err.message || err);
-    return texts.map(() => []);
+    console.error("❌ Embedding API error:", err.response?.data || err.message || err);
+    return texts.map(() => []); // return same length to avoid crash
   }
 }
+
 
 /* ============================
    Build vector store in Supabase
@@ -50,6 +51,7 @@ async function buildVectorStore() {
   const { count } = await supabase
     .from("course_vectors")
     .select("*", { count: "exact", head: true });
+
   if (count > 0) {
     console.log(`⚡ Skipping build — DB already has ${count} rows`);
     return;
@@ -58,6 +60,7 @@ async function buildVectorStore() {
   let texts = [];
   let meta = [];
   let processed = 0;
+  const BATCH_SIZE = 20; // safer than 50
 
   for (const [pi, provider] of raw.entries()) {
     for (const course of provider.courses || []) {
@@ -76,41 +79,59 @@ async function buildVectorStore() {
           },
         });
 
-        // Process in batches of 50
-        if (texts.length >= 50) {
+        // Process when batch full
+        if (texts.length >= BATCH_SIZE) {
           await embedAndInsert(texts, meta);
           processed += texts.length;
+          console.log(`✅ Processed ${processed} rows (provider ${pi + 1}/${raw.length})`);
           texts = [];
           meta = [];
-          console.log(
-            `✅ Processed ${processed} courses (provider ${pi + 1}/${raw.length})`
-          );
         }
       }
     }
   }
 
+  // Insert leftovers
   if (texts.length) {
     await embedAndInsert(texts, meta);
     processed += texts.length;
   }
 
-  console.log(`🎉 Vector store built with ${processed} rows`);
+  console.log(`🎉 Vector store built with ${processed} rows total`);
 }
+
 
 /* ============================
    Insert batch into Supabase
 ============================= */
 async function embedAndInsert(texts, meta) {
   const vectors = await getEmbeddingsBatch(texts);
+
+  if (!vectors || vectors.length !== texts.length) {
+    console.error("❌ Embedding batch failed, skipping this batch");
+    return;
+  }
+
   const rows = vectors.map((vec, i) => ({
-    ...meta[i],
-    embedding: vec,
+    title: meta[i].title,
+    qualification: meta[i].qualification,
+    campus: meta[i].campus,
+    start_date: meta[i].start_date,
+    metadata: meta[i].metadata,
+    embedding: vec, // float[]
   }));
 
-  const { error } = await supabase.from("course_vectors").insert(rows);
-  if (error) console.error("Insert error:", error);
+  const { data, error } = await supabase.from("course_vectors").insert(rows);
+
+  if (error) {
+    console.error("❌ Insert error:", error);
+  } else {
+    console.log(`   ↳ Inserted ${rows.length} rows`);
+  }
 }
+
+
+
 
 /* ============================
    Query top-k similar courses
