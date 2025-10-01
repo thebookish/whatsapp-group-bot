@@ -74,8 +74,9 @@ async function querySupabaseCourses(question, k = 50) {
 function summarizeRows(rows, limit = 10) {
   return rows
     .slice(0, limit)
-    .map((r, i) => {
-      const title = r.title || "Course";
+    .filter((r) => r.title && r.title.trim().length > 0) // 🔥 skip rows with no title
+    .map((r) => {
+      const title = r.title;
       // const qual = r.qualification ? `Qualification: ${r.qualification}` : null;
       const campus = r.campus ? `Campus: ${r.campus}` : null;
       const start = r.start_date ? `Start: ${r.start_date}` : null;
@@ -87,7 +88,7 @@ function summarizeRows(rows, limit = 10) {
         : null;
 
       return [
-        `• ${title}`,       // course title as bullet
+        `• ${title}`,
         // qual,
         campus,
         start,
@@ -95,10 +96,11 @@ function summarizeRows(rows, limit = 10) {
         provider,
       ]
         .filter(Boolean)
-        .join("\n  "); // indent details
+        .join("\n  ");
     })
-    .join("\n\n"); // blank line between courses
+    .join("\n\n");
 }
+
 
 
 function buildRAGContext(records = []) {
