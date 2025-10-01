@@ -286,74 +286,61 @@ async function getAIResponse(userId, rawMessage) {
       }
     }
 
-    // 🤖 LLM call with tools
+    // 🤖 LLM call with functions
     const res = await axios.post(
       "https://openrouter.ai/api/v1/chat/completions",
       {
         model: "mistralai/mistral-7b-instruct",
-        tool_choice: "required", // ⬅ Force tool use
         messages: [
           {
             role: "system",
             content:
-              "You are a Student Assistant. Use tools, not generic answers. Courses/unis → queryDataset. Housing → searchUKAccommodation. Reminders → addReminder. Connect → handleConnectIntent. Always prefer calling a tool.",
+              "You are a Student Assistant. Use functions, not generic answers. Courses/unis → queryDataset. Housing → searchUKAccommodation. Reminders → addReminder. Connect → handleConnectIntent. Always prefer calling a function.",
           },
           { role: "user", content: messageText },
         ],
-        tools: [
+        functions: [
           {
-            type: "function",
-            function: {
-              name: "queryDataset",
-              description: "Get university or course info",
-              parameters: {
-                type: "object",
-                properties: { query: { type: "string" } },
-                required: ["query"],
+            name: "queryDataset",
+            description: "Get university or course info",
+            parameters: {
+              type: "object",
+              properties: { query: { type: "string" } },
+              required: ["query"],
+            },
+          },
+          {
+            name: "searchUKAccommodation",
+            description: "Find UK student accommodation",
+            parameters: {
+              type: "object",
+              properties: {
+                place_name: { type: "string" },
+                price_max: { type: "number" },
+                bedrooms: { type: "number" },
               },
             },
           },
           {
-            type: "function",
-            function: {
-              name: "searchUKAccommodation",
-              description: "Find UK student accommodation",
-              parameters: {
-                type: "object",
-                properties: {
-                  place_name: { type: "string" },
-                  price_max: { type: "number" },
-                  bedrooms: { type: "number" },
-                },
+            name: "addReminder",
+            description: "Set a reminder",
+            parameters: {
+              type: "object",
+              properties: {
+                task: { type: "string" },
+                datetime: { type: "string", format: "date-time" },
               },
+              required: ["task", "datetime"],
             },
           },
           {
-            type: "function",
-            function: {
-              name: "addReminder",
-              description: "Set a reminder",
-              parameters: {
-                type: "object",
-                properties: {
-                  task: { type: "string" },
-                  datetime: { type: "string", format: "date-time" },
-                },
-                required: ["task", "datetime"],
-              },
-            },
-          },
-          {
-            type: "function",
-            function: {
-              name: "handleConnectIntent",
-              description: "Connect nearby students",
-              parameters: {
-                type: "object",
-                properties: {
-                  topic: { type: "string" },
-                  radiusKm: { type: "number" },
-                },
+            name: "handleConnectIntent",
+            description: "Connect nearby students",
+            parameters: {
+              type: "object",
+              properties: {
+                topic: { type: "string" },
+                radiusKm: { type: "number" },
               },
             },
           },
@@ -367,15 +354,15 @@ async function getAIResponse(userId, rawMessage) {
     const choice = res.data?.choices?.[0];
     const msg = choice?.message || {};
 
-    // 🔑 Normalize tool calls (support both formats)
-    const toolCalls = msg.tool_calls || (msg.function_call ? [msg.function_call] : []);
+    // 🔑 Normalize function call
+    const funcCall = msg.function_call ? [msg.function_call] : [];
 
-    // 🛠 Handle tool calls
-    if (toolCalls && toolCalls.length) {
-      for (const call of toolCalls) {
+    // 🛠 Handle function calls
+    if (funcCall && funcCall.length) {
+      for (const call of funcCall) {
         try {
-          const fnName = call.function?.name || call.name;
-          const argsRaw = call.function?.arguments || call.arguments;
+          const fnName = call.name;
+          const argsRaw = call.arguments;
           const args = argsRaw ? JSON.parse(argsRaw) : {};
 
           switch (fnName) {
@@ -406,10 +393,10 @@ async function getAIResponse(userId, rawMessage) {
             }
 
             default:
-              return "❌ I didn’t understand the tool request.";
+              return "❌ I didn’t understand the function request.";
           }
         } catch (err) {
-          console.error("❌ Tool call error:", err);
+          console.error("❌ Function call error:", err);
           return "Sorry, I couldn’t process that request.";
         }
       }
@@ -466,10 +453,10 @@ async function getAIResponse(userId, rawMessage) {
       return reply;
     }
 
-    // 🚨 Fallback: if no tool call & no content
+    // 🚨 Fallback
     return msg.content || "Sorry, I couldn’t process that.";
   } catch (error) {
-    console.error("getAIResponse error:", error);
+    console.error("getAIResponse error:", error.response?.data || error.message);
     return "Sorry, something went wrong.";
   }
 }
