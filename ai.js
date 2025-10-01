@@ -381,15 +381,18 @@ async function getAIResponse(userId, rawMessage) {
           console.debug("🔧 Tool call:", fnName, args);
 
           switch (fnName) {
-            case "queryDataset": {
-              const result = await queryDataset(args.query, { max: 200 });
-              if (result?.rows?.length) {
-                profile.lastRows = result.rows;
-                profile.lastOffset = Math.min(5, result.rows.length);
-                return formatCourseSlice( 0, 5, result.text || "");
-              }
-              return "No matching courses found.";
-            }
+case "queryDataset": {
+  const result = await queryDataset(args.query, { max: 200 });
+  if (result?.rows?.length) {
+    profile.lastRows = result.rows;
+    profile.lastOffset = Math.min(5, result.rows.length);
+
+    // ✅ Only pass the rows to formatCourseSlice, no result.text
+    return formatCourseSlice(result.rows, 0, 5);
+  }
+  return "No matching courses found.";
+}
+
             case "searchUKAccommodation": {
               const { listings } = await searchUKAccommodation(args);
               return formatAccommodationReply(listings);
