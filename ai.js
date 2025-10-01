@@ -286,7 +286,7 @@ async function getAIResponse(userId, rawMessage) {
       }
     }
 
-    // 🤖 LLM call with functions
+    // 🤖 LLM call with tools
     const res = await axios.post(
       "https://openrouter.ai/api/v1/chat/completions",
       {
@@ -295,75 +295,88 @@ async function getAIResponse(userId, rawMessage) {
           {
             role: "system",
             content:
-              "You are a Student Assistant. Use functions, not generic answers. Courses/unis → queryDataset. Housing → searchUKAccommodation. Reminders → addReminder. Connect → handleConnectIntent. Always prefer calling a function.",
+              "You are a Student Assistant. Use tools, not generic answers. Courses/unis → queryDataset. Housing → searchUKAccommodation. Reminders → addReminder. Connect → handleConnectIntent. Always prefer calling a tool.",
           },
           { role: "user", content: messageText },
         ],
-        functions: [
+        tools: [
           {
-            name: "queryDataset",
-            description: "Get university or course info",
-            parameters: {
-              type: "object",
-              properties: { query: { type: "string" } },
-              required: ["query"],
-            },
-          },
-          {
-            name: "searchUKAccommodation",
-            description: "Find UK student accommodation",
-            parameters: {
-              type: "object",
-              properties: {
-                place_name: { type: "string" },
-                price_max: { type: "number" },
-                bedrooms: { type: "number" },
+            type: "function",
+            function: {
+              name: "queryDataset",
+              description: "Get university or course info",
+              parameters: {
+                type: "object",
+                properties: { query: { type: "string" } },
+                required: ["query"],
               },
             },
           },
           {
-            name: "addReminder",
-            description: "Set a reminder",
-            parameters: {
-              type: "object",
-              properties: {
-                task: { type: "string" },
-                datetime: { type: "string", format: "date-time" },
+            type: "function",
+            function: {
+              name: "searchUKAccommodation",
+              description: "Find UK student accommodation",
+              parameters: {
+                type: "object",
+                properties: {
+                  place_name: { type: "string" },
+                  price_max: { type: "number" },
+                  bedrooms: { type: "number" },
+                },
               },
-              required: ["task", "datetime"],
             },
           },
           {
-            name: "handleConnectIntent",
-            description: "Connect nearby students",
-            parameters: {
-              type: "object",
-              properties: {
-                topic: { type: "string" },
-                radiusKm: { type: "number" },
+            type: "function",
+            function: {
+              name: "addReminder",
+              description: "Set a reminder",
+              parameters: {
+                type: "object",
+                properties: {
+                  task: { type: "string" },
+                  datetime: { type: "string", format: "date-time" },
+                },
+                required: ["task", "datetime"],
+              },
+            },
+          },
+          {
+            type: "function",
+            function: {
+              name: "handleConnectIntent",
+              description: "Connect nearby students",
+              parameters: {
+                type: "object",
+                properties: {
+                  topic: { type: "string" },
+                  radiusKm: { type: "number" },
+                },
               },
             },
           },
         ],
+        tool_choice: "auto", // "required" if you want to force tool usage
         temperature: 0,
         max_tokens: 200,
       },
       { headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}` } }
     );
 
-    const choice = res.data?.choices?.[0];
-    const msg = choice?.message || {};
+    const msg = res.data?.choices?.[0]?.message || {};
 
-    // 🔑 Normalize function call
-    const funcCall = msg.function_call ? [msg.function_call] : [];
+    // 🔑 Parse tool calls
+    const toolCalls = msg.tool_calls || [];
 
-    // 🛠 Handle function calls
-    if (funcCall && funcCall.length) {
-      for (const call of funcCall) {
+    if (toolCalls.length) {
+      for (const call of toolCalls) {
         try {
-          const fnName = call.name;
-          const argsRaw = call.arguments;
+          const fnName = call.function?.name;
+          const argsRaw = call.function?.arguments;
           const args = argsRaw ? JSON.parse(argsRaw) : {};
+
+          console.debug("🔧 Tool call:", fnName, args);
 
           switch (fnName) {
             case "queryDataset": {
@@ -393,10 +406,10 @@ async function getAIResponse(userId, rawMessage) {
             }
 
             default:
-              return "❌ I didn’t understand the function request.";
+              return "❌ I didn’t understand the tool request.";
           }
         } catch (err) {
-          console.error("❌ Function call error:", err);
+          console.error("❌ Tool call error:", err);
           return "Sorry, I couldn’t process that request.";
         }
       }
