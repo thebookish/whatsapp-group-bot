@@ -271,56 +271,82 @@ async function getAIResponse(userId, rawMessage) {
 
     // Call LLM with tool options
     const res = await axios.post("https://openrouter.ai/api/v1/chat/completions", {
-      model: "mistralai/mistral-7b-instruct",
-      messages: [
-        { role: "system", content: "You are a Student Assistant. Use tools, not generic answers. Courses/unis → queryDataset. Housing → searchUKAccommodation. Reminders → addReminder. Connect → handleConnectIntent. Always prefer calling a tool." },
-        { role: "user", content: messageText }
-      ],
-      tools: [
-        {
-          name: "queryDataset",
-          description: "Get university or course info",
-          parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] }
-        },
-        {
-          name: "searchUKAccommodation",
-          description: "Find UK student accommodation",
-          parameters: {
-            type: "object",
-            properties: {
-              place_name: { type: "string" },
-              price_max: { type: "number" },
-              bedrooms: { type: "number" }
-            }
-          }
-        },
-        {
-          name: "addReminder",
-          description: "Set a reminder",
-          parameters: {
-            type: "object",
-            properties: {
-              task: { type: "string" },
-              datetime: { type: "string", format: "date-time" }
-            },
-            required: ["task", "datetime"]
-          }
-        },
-        {
-          name: "handleConnectIntent",
-          description: "Connect nearby students",
-          parameters: {
-            type: "object",
-            properties: {
-              topic: { type: "string" },
-              radiusKm: { type: "number" }
-            }
+      
+  "model": "mistralai/mistral-7b-instruct",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a Student Assistant. Use tools, not generic answers. Courses/unis → queryDataset. Housing → searchUKAccommodation. Reminders → addReminder. Connect → handleConnectIntent. Always prefer calling a tool."
+    },
+    {
+      "role": "user",
+      "content": "Find me computer science courses in London"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "queryDataset",
+        "description": "Get university or course info",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": { "type": "string" }
+          },
+          "required": ["query"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "searchUKAccommodation",
+        "description": "Find UK student accommodation",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "place_name": { "type": "string" },
+            "price_max": { "type": "number" },
+            "bedrooms": { "type": "number" }
           }
         }
-      ],
-      temperature: 0,
-      max_tokens: 200
-    }, { headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}` } });
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "addReminder",
+        "description": "Set a reminder",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "task": { "type": "string" },
+            "datetime": { "type": "string", "format": "date-time" }
+          },
+          "required": ["task", "datetime"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "handleConnectIntent",
+        "description": "Connect nearby students",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "topic": { "type": "string" },
+            "radiusKm": { "type": "number" }
+          }
+        }
+      }
+    }
+  ],
+  "temperature": 0,
+  "max_tokens": 200
+}
+, { headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}` } });
 
     const choice = res.data?.choices?.[0];
     const toolCalls = choice?.message?.tool_calls;
