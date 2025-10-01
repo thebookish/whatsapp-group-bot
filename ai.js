@@ -1,4 +1,4 @@
-const axios = require("axios");
+const OpenAI = require("openai");
 const { supabase, OPENROUTER_API_KEY, NESTORIA_ENDPOINT } = require("./config");
 const { normBase, queryDataset } = require("./rag");
 const { addReminder } = require("./reminder");
@@ -8,6 +8,14 @@ const {
   handleAcceptCode,
   upsertUserLocation,
 } = require("./match");
+const axios = require("axios");
+
+/* ============================
+   OpenAI Client
+============================= */
+const openai = new OpenAI({
+  apiKey: OPENROUTER_API_KEY, // 🔑 using same env variable as requested
+});
 
 /* ============================
    Onboarding & App State
@@ -287,86 +295,80 @@ async function getAIResponse(userId, rawMessage) {
     }
 
     // 🤖 LLM call with tools
-    const res = await axios.post(
-      "https://openrouter.ai/api/v1/chat/completions",
-      {
-        model: "mistralai/mistral-7b-instruct",
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are a Student Assistant. Use tools, not generic answers. Courses/unis → queryDataset. Housing → searchUKAccommodation. Reminders → addReminder. Connect → handleConnectIntent. Always prefer calling a tool.",
+    const res = await openai.chat.completions.create({
+      model: "gpt-4.0-mini",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a Student Assistant. Use tools, not generic answers. Courses/unis → queryDataset. Housing → searchUKAccommodation. Reminders → addReminder. Connect → handleConnectIntent. Always prefer calling a tool.",
+        },
+        { role: "user", content: messageText },
+      ],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "queryDataset",
+            description: "Get university or course info",
+            parameters: {
+              type: "object",
+              properties: { query: { type: "string" } },
+              required: ["query"],
+            },
           },
-          { role: "user", content: messageText },
-        ],
-        tools: [
-          {
-            type: "function",
-            function: {
-              name: "queryDataset",
-              description: "Get university or course info",
-              parameters: {
-                type: "object",
-                properties: { query: { type: "string" } },
-                required: ["query"],
+        },
+        {
+          type: "function",
+          function: {
+            name: "searchUKAccommodation",
+            description: "Find UK student accommodation",
+            parameters: {
+              type: "object",
+              properties: {
+                place_name: { type: "string" },
+                price_max: { type: "number" },
+                bedrooms: { type: "number" },
               },
             },
           },
-          {
-            type: "function",
-            function: {
-              name: "searchUKAccommodation",
-              description: "Find UK student accommodation",
-              parameters: {
-                type: "object",
-                properties: {
-                  place_name: { type: "string" },
-                  price_max: { type: "number" },
-                  bedrooms: { type: "number" },
-                },
+        },
+        {
+          type: "function",
+          function: {
+            name: "addReminder",
+            description: "Set a reminder",
+            parameters: {
+              type: "object",
+              properties: {
+                task: { type: "string" },
+                datetime: { type: "string", format: "date-time" },
+              },
+              required: ["task", "datetime"],
+            },
+          },
+        },
+        {
+          type: "function",
+          function: {
+            name: "handleConnectIntent",
+            description: "Connect nearby students",
+            parameters: {
+              type: "object",
+              properties: {
+                topic: { type: "string" },
+                radiusKm: { type: "number" },
               },
             },
           },
-          {
-            type: "function",
-            function: {
-              name: "addReminder",
-              description: "Set a reminder",
-              parameters: {
-                type: "object",
-                properties: {
-                  task: { type: "string" },
-                  datetime: { type: "string", format: "date-time" },
-                },
-                required: ["task", "datetime"],
-              },
-            },
-          },
-          {
-            type: "function",
-            function: {
-              name: "handleConnectIntent",
-              description: "Connect nearby students",
-              parameters: {
-                type: "object",
-                properties: {
-                  topic: { type: "string" },
-                  radiusKm: { type: "number" },
-                },
-              },
-            },
-          },
-        ],
-        tool_choice: "auto", // "required" if you want to force tool usage
-        temperature: 0,
-        max_tokens: 200,
-      },
-      { headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}` } }
-    );
+        },
+      ],
+      tool_choice: "auto",
+      temperature: 0,
+      max_tokens: 200,
+    });
 
-    const msg = res.data?.choices?.[0]?.message || {};
-
-    // 🔑 Parse tool calls
+    const msg = res.choices?.[0]?.message || {};
     const toolCalls = msg.tool_calls || [];
 
     if (toolCalls.length) {
@@ -388,23 +390,19 @@ async function getAIResponse(userId, rawMessage) {
               }
               return "No matching courses found.";
             }
-
             case "searchUKAccommodation": {
               const { listings } = await searchUKAccommodation(args);
               return formatAccommodationReply(listings);
             }
-
             case "addReminder": {
               await addReminder(uid, args.task, new Date(args.datetime));
               return `✅ Reminder set for "${args.task}" at ${new Date(
                 args.datetime
               ).toLocaleString()}`;
             }
-
             case "handleConnectIntent": {
               return await handleConnectIntent({ requesterId: uid, ...args });
             }
-
             default:
               return "❌ I didn’t understand the tool request.";
           }
@@ -415,7 +413,7 @@ async function getAIResponse(userId, rawMessage) {
       }
     }
 
-    // ✅ Accept handling (manual input)
+    // ✅ Accept handling
     if (ACCEPT_PAT.test(messageText)) {
       const m = messageText.match(ACCEPT_PAT);
       if (m) return await handleAcceptCode(uid, m[1]);
@@ -473,9 +471,6 @@ async function getAIResponse(userId, rawMessage) {
     return "Sorry, something went wrong.";
   }
 }
-
-
-
 
 /* ============================
    Exports
