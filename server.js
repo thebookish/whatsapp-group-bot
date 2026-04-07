@@ -11,6 +11,14 @@ const { getAIResponse } = require('./ai');
 const { initMatch } = require('./match');
 const { WebSocketServer } = require('ws');
 const { startReminderScheduler } = require('./reminder');
+const {
+  initNotifications,
+  startRealtimeSubscription,
+  stopRealtimeSubscription,
+  getRecentAlerts,
+  markAlertRead,
+  dismissAlert,
+} = require('./notifications');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -19,8 +27,40 @@ const KEEP_ALIVE_MS = 10000;
 const TRIGGER_KEYWORD = 'heybot';
 const CONVERSATION_TIMEOUT = 30 * 60 * 1000; // 30 min
 
+app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('/health', (req, res) => res.json({ ok: true }));
+
+/* ============================
+   Notification REST API
+============================= */
+app.get('/api/notifications', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 20;
+    const alerts = await getRecentAlerts(limit);
+    res.json({ ok: true, alerts });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/api/notifications/:id/read', async (req, res) => {
+  try {
+    const success = await markAlertRead(req.params.id);
+    res.json({ ok: success });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/api/notifications/:id/dismiss', async (req, res) => {
+  try {
+    const success = await dismissAlert(req.params.id);
+    res.json({ ok: success });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
 
 const server = app.listen(PORT, () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);
@@ -164,6 +204,15 @@ initMatch({
         botJid = sock.user.id;
         console.log('🤖 Bot JID:', botJid);
         broadcast({ type: 'status', status: 'connected' });
+
+        // Start real-time notification system
+        initNotifications({
+          send: async (jid, text) => {
+            await sock.sendMessage(jid, { text });
+          },
+          broadcast,
+        });
+        startRealtimeSubscription();
       } else if (connection === 'close') {
         const reason = lastDisconnect?.error?.output?.statusCode;
         const isLoggedOut = reason === DisconnectReason.loggedOut;
@@ -298,6 +347,7 @@ startReminderScheduler(async (userId, text) => {
 process.on('SIGINT', async () => {
   console.log('\n👋 Shutting down...');
   shouldStop = true;
+  await stopRealtimeSubscription();
   try { if (sock && sock.ws && sock.ws.readyState === 1) await sock.end(); } catch {}
   server.close(() => process.exit(0));
 });
