@@ -114,6 +114,7 @@ let reconnectAttempt = 0;
 const MAX_RECONNECT_DELAY = 60000;
 let lastQr = null;
 let connectionStatus = 'disconnected';
+let qrPendingScan = false; // true when QR is displayed and waiting for user to scan
 
 /* ============================
    Message utils
@@ -197,22 +198,21 @@ async function startBot() {
 
     sock = makeWASocket({
       auth: state,
-      printQRInTerminal: true,
       keepAliveIntervalMs: KEEP_ALIVE_MS,
       browser: ['WhatsApp Bot', 'Chrome', '22.04.4'],
     });
 
-    // QR watchdog — if no QR or connection within 30s, clear stale auth and retry
+    // QR watchdog — if no QR or connection within 45s, clear stale auth and retry
     const qrWatchdog = setTimeout(() => {
-      if (connectionStatus !== 'connected' && !lastQr) {
-        console.warn('⚠️  No QR generated within 30s — clearing stale auth and retrying...');
+      if (connectionStatus !== 'connected' && !lastQr && !qrPendingScan) {
+        console.warn('\u26a0\ufe0f  No QR generated within 45s — clearing stale auth and retrying...');
         try { if (sock?.ws?.readyState === 1) sock.end(); } catch {}
         const fs = require('fs');
         try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch {}
         isStarting = false;
         if (!shouldStop) startBot();
       }
-    }, 30000);
+    }, 45000);
 
     /* === init match system with send + createGroup === */
 initMatch({
@@ -233,16 +233,16 @@ initMatch({
       if (qr) {
         clearTimeout(qrWatchdog);
         lastQr = qr;
+        qrPendingScan = true;
         connectionStatus = 'disconnected';
         broadcast({ type: 'qr', qr });
-        console.log('📷 New QR generated — broadcast to', wss.clients.size, 'client(s)');
+        console.log('\ud83d\udcf7 New QR generated — broadcast to', wss.clients.size, 'client(s). Waiting for scan...');
       }
       if (connection === 'open') {
         clearTimeout(qrWatchdog);
         console.log('✅ WhatsApp connected');
         reconnectAttempt = 0;
-        lastQr = null;
-        connectionStatus = 'connected';
+        lastQr = null;        qrPendingScan = false;        connectionStatus = 'connected';
         botJid = sock.user.id;
         console.log('🤖 Bot JID:', botJid);
         broadcast({ type: 'status', status: 'connected' });
@@ -259,9 +259,24 @@ initMatch({
         const reason = lastDisconnect?.error?.output?.statusCode;
         const isLoggedOut = reason === DisconnectReason.loggedOut;
         console.log('🔌 Connection closed.', reason, 'loggedOut:', isLoggedOut);
-        lastQr = null;
         connectionStatus = 'disconnected';
         broadcast({ type: 'status', status: 'disconnected', reason });
+
+        // If QR is pending scan, DON'T reconnect — just wait for user to scan
+        if (qrPendingScan && !isLoggedOut) {
+          console.log('\u23f3 QR is pending scan — not reconnecting. Open the dashboard to scan.');
+          lastQr = null;
+          qrPendingScan = false;
+          // Wait longer then retry to get a fresh QR
+          setTimeout(() => {
+            isStarting = false;
+            if (!shouldStop) startBot();
+          }, 60000); // 60s cooldown before next QR attempt
+          return;
+        }
+
+        lastQr = null;
+        qrPendingScan = false;
         if (!isLoggedOut) {
           reconnectAttempt++;
           const delay = Math.min(2000 * Math.pow(1.5, reconnectAttempt - 1), MAX_RECONNECT_DELAY);
