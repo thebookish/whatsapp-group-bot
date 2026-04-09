@@ -29,9 +29,14 @@
             document.getElementById('qr-code').innerHTML = `<img src="${url}" />`;
           });
       } else if (data.type === 'status') {
-        document.getElementById('status').innerText = data.status === 'connected'
-          ? '✅ WhatsApp connected!'
-          : '❌ Disconnected... waiting for QR again';
+        if (data.status === 'connected') {
+          document.getElementById('status').innerText = '✅ WhatsApp connected!';
+          document.getElementById('qr-code').innerHTML = '';
+        } else if (data.status === 'connecting') {
+          document.getElementById('status').innerText = '🔄 Connecting... please wait';
+        } else {
+          document.getElementById('status').innerText = '⏳ Waiting for QR code...';
+        }
       }
     };
   </script>

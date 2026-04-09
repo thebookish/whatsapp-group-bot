@@ -1,6 +1,5 @@
 // reminders.js
 const { supabase } = require('./config');
-const { getAIResponse } = require('./ai'); // ✅ so we can send reminder messages
 
 /**
  * Add a reminder to Supabase
@@ -63,16 +62,18 @@ async function markReminderSent(id) {
   try {
     console.log("✔️ Marking reminder sent:", id);
 
-    const { error } = await supabase
-      .from('reminders')
-      .update({ sent: true })
-      .eq('id', id);
+    const { error } = await withRetry(() =>
+      supabase
+        .from('reminders')
+        .update({ sent: true })
+        .eq('id', id)
+    );
 
     if (error) {
-      console.error('❌ Error marking reminder sent:', error);
+      console.error('\u274c Error marking reminder sent:', error);
     }
   } catch (err) {
-    console.error("❌ markReminderSent unexpected error:", err);
+    console.error('\u274c markReminderSent unexpected error:', err.message || err);
   }
 }
 
