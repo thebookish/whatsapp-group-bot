@@ -295,6 +295,17 @@ initMatch({
 
         if (qrWatchdogTimer) { clearTimeout(qrWatchdogTimer); qrWatchdogTimer = null; }
 
+        // 515 = restart required (normal right after first successful pairing) — reconnect immediately
+        const isRestartRequired = reason === DisconnectReason.restartRequired || reason === 515;
+        if (isRestartRequired) {
+          console.log('\ud83d\udd01 Restart required after pairing — reconnecting immediately...');
+          lastQr = null;
+          qrPendingScan = false;
+          reconnectAttempt = 0;
+          scheduleReconnect(500);
+          return;
+        }
+
         // If QR is pending scan, DON'T reconnect — just wait for user to scan
         if (qrPendingScan && !isLoggedOut) {
           console.log('\u23f3 QR is pending scan — not reconnecting. Open the dashboard to scan.');
