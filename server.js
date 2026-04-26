@@ -5,7 +5,9 @@ const {
   default: makeWASocket,
   DisconnectReason,
   useMultiFileAuthState,
-  jidNormalizedUser
+  jidNormalizedUser,
+  fetchLatestBaileysVersion,
+  Browsers,
 } = require('@whiskeysockets/baileys');
 const { getAIResponse } = require('./ai');
 const { initMatch } = require('./match');
@@ -115,6 +117,18 @@ const MAX_RECONNECT_DELAY = 60000;
 let lastQr = null;
 let connectionStatus = 'disconnected';
 let qrPendingScan = false; // true when QR is displayed and waiting for user to scan
+let reconnectTimer = null;
+let qrWatchdogTimer = null;
+let keepAliveStarted = false;
+
+function scheduleReconnect(delay) {
+  if (reconnectTimer || shouldStop) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    isStarting = false;
+    if (!shouldStop) startBot();
+  }, delay);
+}
 
 /* ============================
    Message utils
@@ -183,7 +197,7 @@ function updateConversationActivity(conversationKey) {
    Bot start
 ============================= */
 async function startBot() {
-  if (isStarting) return;
+  if (isStarting || reconnectTimer) return;
   isStarting = true;
 
   try {
@@ -192,27 +206,44 @@ async function startBot() {
     saveCreds = _saveCreds;
 
     if (sock) {
+      try { sock.ev.removeAllListeners(); } catch {}
       try { if (sock.ws && sock.ws.readyState === 1) await sock.end(); } catch {}
       sock = null;
     }
 
+    // Always fetch the live WhatsApp Web version — using a stale version causes 405 handshake errors
+    let version;
+    try {
+      const v = await fetchLatestBaileysVersion();
+      version = v.version;
+      console.log(`\ud83d\udce6 Using WhatsApp Web version ${version.join('.')} (latest: ${v.isLatest})`);
+    } catch (e) {
+      console.warn('Could not fetch latest WA version, using Baileys default:', e.message);
+    }
+
     sock = makeWASocket({
       auth: state,
+      version,
       keepAliveIntervalMs: KEEP_ALIVE_MS,
-      browser: ['WhatsApp Bot', 'Chrome', '22.04.4'],
+      // Use a standard browser tuple — custom names trigger 405 handshake rejections
+      browser: Browsers.ubuntu('Chrome'),
+      printQRInTerminal: false,
+      syncFullHistory: false,
+      markOnlineOnConnect: false,
     });
 
-    // QR watchdog — if no QR or connection within 45s, clear stale auth and retry
-    const qrWatchdog = setTimeout(() => {
-      if (connectionStatus !== 'connected' && !lastQr && !qrPendingScan) {
-        console.warn('\u26a0\ufe0f  No QR generated within 45s — clearing stale auth and retrying...');
-        try { if (sock?.ws?.readyState === 1) sock.end(); } catch {}
-        const fs = require('fs');
-        try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch {}
-        isStarting = false;
-        if (!shouldStop) startBot();
-      }
-    }, 45000);
+    if (qrWatchdogTimer) { clearTimeout(qrWatchdogTimer); qrWatchdogTimer = null; }
+    // QR watchdog — if no QR or connection within 60s, clear stale auth and retry
+    qrWatchdogTimer = setTimeout(() => {
+      qrWatchdogTimer = null;
+      if (connectionStatus === 'connected' || lastQr || qrPendingScan) return;
+      console.warn('\u26a0\ufe0f  No QR generated within 60s — clearing stale auth and retrying...');
+      try { sock?.ev?.removeAllListeners(); } catch {}
+      try { if (sock?.ws?.readyState === 1) sock.end(); } catch {}
+      const fs = require('fs');
+      try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch {}
+      scheduleReconnect(2000);
+    }, 60000);
 
     /* === init match system with send + createGroup === */
 initMatch({
@@ -231,7 +262,7 @@ initMatch({
       console.log('🔔 connection.update:', JSON.stringify(Object.keys(update)));
       const { connection, lastDisconnect, qr } = update;
       if (qr) {
-        clearTimeout(qrWatchdog);
+        if (qrWatchdogTimer) { clearTimeout(qrWatchdogTimer); qrWatchdogTimer = null; }
         lastQr = qr;
         qrPendingScan = true;
         connectionStatus = 'disconnected';
@@ -239,7 +270,7 @@ initMatch({
         console.log('\ud83d\udcf7 New QR generated — broadcast to', wss.clients.size, 'client(s). Waiting for scan...');
       }
       if (connection === 'open') {
-        clearTimeout(qrWatchdog);
+        if (qrWatchdogTimer) { clearTimeout(qrWatchdogTimer); qrWatchdogTimer = null; }
         console.log('✅ WhatsApp connected');
         reconnectAttempt = 0;
         lastQr = null;        qrPendingScan = false;        connectionStatus = 'connected';
@@ -262,16 +293,14 @@ initMatch({
         connectionStatus = 'disconnected';
         broadcast({ type: 'status', status: 'disconnected', reason });
 
+        if (qrWatchdogTimer) { clearTimeout(qrWatchdogTimer); qrWatchdogTimer = null; }
+
         // If QR is pending scan, DON'T reconnect — just wait for user to scan
         if (qrPendingScan && !isLoggedOut) {
           console.log('\u23f3 QR is pending scan — not reconnecting. Open the dashboard to scan.');
           lastQr = null;
           qrPendingScan = false;
-          // Wait longer then retry to get a fresh QR
-          setTimeout(() => {
-            isStarting = false;
-            if (!shouldStop) startBot();
-          }, 60000); // 60s cooldown before next QR attempt
+          scheduleReconnect(60000); // 60s cooldown before next QR attempt
           return;
         }
 
@@ -281,10 +310,7 @@ initMatch({
           reconnectAttempt++;
           const delay = Math.min(2000 * Math.pow(1.5, reconnectAttempt - 1), MAX_RECONNECT_DELAY);
           console.log(`🔄 Reconnecting in ${Math.round(delay / 1000)}s (attempt ${reconnectAttempt})...`);
-          setTimeout(() => {
-            isStarting = false;
-            if (!shouldStop) startBot();
-          }, delay);
+          scheduleReconnect(delay);
         } else {
           console.log('❌ Logged out — restart with new QR.');
         }
@@ -377,23 +403,26 @@ initMatch({
       }
     });
 
-    /* === Keep alive / presence / cleanup === */
-    setInterval(() => { try { if (sock?.ws && sock.ws.readyState === 1) sock.ws.ping(); } catch {} }, 30000);
-    setInterval(async () => { try { if (sock?.user) await sock.sendPresenceUpdate('available'); } catch {} }, 60000);
-    setInterval(() => {
-      const now = Date.now();
-      for (const [key, conv] of activeConversations.entries()) {
-        if (now - conv.lastActivity >= CONVERSATION_TIMEOUT) {
-          activeConversations.delete(key);
-          console.log(`🧹 Expired conversation: ${key}`);
+    /* === Keep alive / presence / cleanup (started once globally) === */
+    if (!keepAliveStarted) {
+      keepAliveStarted = true;
+      setInterval(() => { try { if (sock?.ws && sock.ws.readyState === 1) sock.ws.ping(); } catch {} }, 30000);
+      setInterval(async () => { try { if (sock?.user) await sock.sendPresenceUpdate('available'); } catch {} }, 60000);
+      setInterval(() => {
+        const now = Date.now();
+        for (const [key, conv] of activeConversations.entries()) {
+          if (now - conv.lastActivity >= CONVERSATION_TIMEOUT) {
+            activeConversations.delete(key);
+            console.log(`🧹 Expired conversation: ${key}`);
+          }
         }
-      }
-    }, 5 * 60 * 1000);
+      }, 5 * 60 * 1000);
+    }
 
     console.log('Bot started.');
   } catch (err) {
     console.error('startBot error:', err);
-    setTimeout(() => { isStarting = false; if (!shouldStop) startBot(); }, 2000);
+    scheduleReconnect(2000);
   } finally {
     isStarting = false;
   }
