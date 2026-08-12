@@ -59,22 +59,27 @@ async function getDueReminders() {
  * Mark a reminder as sent
  */
 async function markReminderSent(id) {
-  try {
-    console.log("✔️ Marking reminder sent:", id);
-
-    const { error } = await withRetry(() =>
-      supabase
+  // `withRetry` was never defined or imported here, so this threw a
+  // ReferenceError on every call: the reminder was never marked sent, and the
+  // scheduler re-delivered it every 30 seconds, forever. Retry inline instead.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const { error } = await supabase
         .from('reminders')
         .update({ sent: true })
-        .eq('id', id)
-    );
+        .eq('id', id);
 
-    if (error) {
-      console.error('\u274c Error marking reminder sent:', error);
+      if (!error) {
+        console.log('\u2714\ufe0f Marked reminder sent:', id);
+        return true;
+      }
+      console.error(`\u274c Error marking reminder sent (attempt ${attempt}):`, error.message || error);
+    } catch (err) {
+      console.error(`\u274c markReminderSent threw (attempt ${attempt}):`, err.message || err);
     }
-  } catch (err) {
-    console.error('\u274c markReminderSent unexpected error:', err.message || err);
+    if (attempt < 3) await new Promise((r) => setTimeout(r, 500 * attempt));
   }
+  return false;
 }
 
 /**
@@ -85,11 +90,14 @@ function startReminderScheduler(sendFn) {
     try {
       const due = await getDueReminders();
       for (const r of due) {
-        console.log("📤 Sending reminder:", r);
-
-        // ✅ Use injected sender function
-        await sendFn(r.user_id, `⏰ Reminder: ${r.message}`);
-
+        try {
+          await sendFn(r.user_id, `\u23f0 Reminder: ${r.message}`);
+        } catch (err) {
+          // Leave it unsent so it retries once WhatsApp is back, and keep
+          // going: one undeliverable reminder must not block the batch.
+          console.error('\u274c Reminder send failed, will retry:', r.id, err.message || err);
+          continue;
+        }
         await markReminderSent(r.id);
       }
     } catch (err) {

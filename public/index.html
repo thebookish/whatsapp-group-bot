@@ -1,44 +1,183 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>WhatsApp Bot QR</title>
+  <title>WhatsApp Bot — Connection</title>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    #qr-container { text-align: center; margin-top: 50px; }
-    #status { font-size: 20px; margin-top: 20px; }
+    :root { color-scheme: light dark; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      background: #0f1117; color: #e7e9ee;
+    }
+    .card {
+      width: min(420px, 92vw); background: #171a23; border: 1px solid #262b38;
+      border-radius: 16px; padding: 28px; text-align: center;
+    }
+    h1 { font-size: 18px; margin: 0 0 4px; }
+    .sub { font-size: 13px; color: #8b93a7; margin: 0 0 20px; }
+    #qr-code img { width: 260px; height: 260px; background: #fff; padding: 10px; border-radius: 12px; }
+    .placeholder {
+      width: 260px; height: 260px; margin: 0 auto; border-radius: 12px;
+      border: 1px dashed #333a4b; display: flex; align-items: center; justify-content: center;
+      color: #6b7488; font-size: 13px; padding: 0 24px; box-sizing: border-box;
+    }
+    #status { font-size: 14px; margin: 18px 0 0; display: flex; align-items: center; justify-content: center; gap: 8px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #6b7488; flex: none; }
+    .dot.connected { background: #34d399; }
+    .dot.connecting, .dot.qr { background: #fbbf24; }
+    .dot.error { background: #f87171; }
+    #expiry { font-size: 12px; color: #6b7488; margin-top: 6px; min-height: 16px; }
+    .actions { margin-top: 20px; display: flex; gap: 8px; justify-content: center; }
+    button {
+      background: #232838; color: #e7e9ee; border: 1px solid #333a4b; border-radius: 8px;
+      padding: 8px 14px; font-size: 13px; cursor: pointer;
+    }
+    button:hover { background: #2b3145; }
+    button:disabled { opacity: .5; cursor: default; }
+    .danger { border-color: #4b2a2a; color: #f8a5a5; }
   </style>
 </head>
 <body>
-  <div id="qr-container">
-    <h2>Scan this QR Code to login</h2>
-    <div id="qr-code"></div>
-    <p id="status">Waiting for QR...</p>
+  <div class="card">
+    <h1>WhatsApp Connection</h1>
+    <p class="sub">Scan with WhatsApp → Linked devices → Link a device</p>
+
+    <div id="qr-code"><div class="placeholder" id="placeholder">Waiting for a QR code…</div></div>
+
+    <p id="status"><span class="dot" id="dot"></span><span id="status-text">Connecting to server…</span></p>
+    <p id="expiry"></p>
+
+    <div class="actions">
+      <button id="refresh">New QR code</button>
+      <button id="logout" class="danger">Reset session</button>
+    </div>
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/qrcode/build/qrcode.min.js"></script>
   <script>
-    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${protocol}//${location.host}`);
+    const qrBox = document.getElementById('qr-code');
+    const statusText = document.getElementById('status-text');
+    const dot = document.getElementById('dot');
+    const expiry = document.getElementById('expiry');
 
-    ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
+    // A QR is only scannable for a short window; count it down rather than
+    // leaving a dead code on screen looking valid.
+    const QR_TTL_MS = 60000;
+    let qrShownAt = 0;
+    let countdown = null;
+    let ws = null;
+    let reconnectDelay = 1000;
+
+    function setStatus(text, kind) {
+      statusText.textContent = text;
+      dot.className = 'dot' + (kind ? ' ' + kind : '');
+    }
+
+    function showPlaceholder(text) {
+      qrBox.innerHTML = '<div class="placeholder">' + text + '</div>';
+      qrShownAt = 0;
+      expiry.textContent = '';
+    }
+
+    function renderQr(value) {
+      if (!window.QRCode) {
+        // CDN blocked — the raw string can still be pasted into any QR tool.
+        qrBox.innerHTML = '<div class="placeholder" style="word-break:break-all;font-size:9px">'
+          + 'QR renderer unavailable. Raw code:<br>' + value + '</div>';
+        return;
+      }
+      QRCode.toDataURL(value, { width: 260, margin: 1 }).then(function (url) {
+        qrBox.innerHTML = '<img alt="WhatsApp pairing QR" src="' + url + '" />';
+      });
+      qrShownAt = Date.now();
+      startCountdown();
+    }
+
+    function startCountdown() {
+      if (countdown) clearInterval(countdown);
+      countdown = setInterval(function () {
+        if (!qrShownAt) { expiry.textContent = ''; return; }
+        const left = Math.max(0, QR_TTL_MS - (Date.now() - qrShownAt));
+        if (left === 0) {
+          expiry.textContent = 'Code expired — a new one is on its way…';
+          clearInterval(countdown);
+          countdown = null;
+          return;
+        }
+        expiry.textContent = 'Expires in ' + Math.ceil(left / 1000) + 's';
+      }, 1000);
+    }
+
+    function handle(data) {
       if (data.type === 'qr') {
-        document.getElementById('status').innerText = 'Please scan the QR code';
-        QRCode.toDataURL(data.qr)
-          .then(url => {
-            document.getElementById('qr-code').innerHTML = `<img src="${url}" />`;
-          });
+        setStatus('Scan the code with WhatsApp', 'qr');
+        renderQr(data.qr);
       } else if (data.type === 'status') {
         if (data.status === 'connected') {
-          document.getElementById('status').innerText = '✅ WhatsApp connected!';
-          document.getElementById('qr-code').innerHTML = '';
-        } else if (data.status === 'connecting') {
-          document.getElementById('status').innerText = '🔄 Connecting... please wait';
+          setStatus('Connected', 'connected');
+          showPlaceholder('✅ WhatsApp is connected');
+        } else if (data.status === 'connecting' || data.status === 'restarting') {
+          setStatus(data.status === 'restarting' ? 'Restarting…' : 'Connecting…', 'connecting');
         } else {
-          document.getElementById('status').innerText = '⏳ Waiting for QR code...';
+          setStatus('Disconnected — retrying', 'error');
+          showPlaceholder('Waiting for a new QR code…');
         }
       }
-    };
+    }
+
+    // The socket used to be opened once; a dropped connection left the page
+    // permanently blank with no indication anything was wrong.
+    function connect() {
+      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(protocol + '//' + location.host);
+
+      ws.onopen = function () { reconnectDelay = 1000; };
+      ws.onmessage = function (event) {
+        try { handle(JSON.parse(event.data)); } catch (e) { console.error(e); }
+      };
+      ws.onclose = function () {
+        setStatus('Lost connection to the bot server — retrying', 'error');
+        setTimeout(connect, reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+      };
+      ws.onerror = function () { try { ws.close(); } catch (e) {} };
+    }
+
+    // Poll as a safety net: proxies that drop WebSocket upgrades would
+    // otherwise leave the operator with no way to see a code at all.
+    async function poll() {
+      try {
+        const res = await fetch('/api/qr');
+        const data = await res.json();
+        if (data.qr && (!qrShownAt || Date.now() - qrShownAt > QR_TTL_MS)) {
+          handle({ type: 'qr', qr: data.qr });
+        } else if (data.connectionStatus === 'connected' && qrShownAt !== 0) {
+          handle({ type: 'status', status: 'connected' });
+        }
+      } catch (e) { /* server down; the WS handler already reports it */ }
+    }
+
+    document.getElementById('refresh').addEventListener('click', async function () {
+      this.disabled = true;
+      setStatus('Requesting a new code…', 'connecting');
+      showPlaceholder('Requesting a new QR code…');
+      try { await fetch('/api/restart', { method: 'POST' }); } catch (e) {}
+      setTimeout(() => { this.disabled = false; }, 3000);
+    });
+
+    document.getElementById('logout').addEventListener('click', async function () {
+      if (!confirm('Reset the session? The bot will disconnect and need a fresh scan.')) return;
+      this.disabled = true;
+      setStatus('Resetting session…', 'connecting');
+      showPlaceholder('Clearing the stored session…');
+      try { await fetch('/api/logout', { method: 'POST' }); } catch (e) {}
+      setTimeout(() => { this.disabled = false; }, 3000);
+    });
+
+    connect();
+    setInterval(poll, 5000);
   </script>
 </body>
 </html>

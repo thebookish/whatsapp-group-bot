@@ -11,11 +11,21 @@ const {
 const axios = require("axios");
 
 /* ============================
-   OpenAI Client
+   OpenAI Client (lazy)
+
+   Same reason as vectorstore.js: `new OpenAI()` throws without a key, and this
+   module is required by server.js, so constructing it eagerly crashed the
+   process at startup and no QR could ever be served.
 ============================= */
-const openai = new OpenAI({
-  apiKey: OPENROUTER_API_KEY, // 🔑 using same env variable as requested
-});
+let _openai;
+function openaiClient() {
+  if (_openai) return _openai;
+  if (!OPENROUTER_API_KEY) {
+    throw new Error('OPENROUTER_API_KEY is not set \u2014 AI replies unavailable.');
+  }
+  _openai = new OpenAI({ apiKey: OPENROUTER_API_KEY }); // same env variable as requested
+  return _openai;
+}
 
 /* ============================
    Onboarding & App State
@@ -295,7 +305,7 @@ async function getAIResponse(userId, rawMessage) {
     }
 
     // 🤖 LLM call with tools
-    const res = await openai.chat.completions.create({
+    const res = await openaiClient().chat.completions.create({
       model: "gpt-4o-mini",
       messages: [
         {

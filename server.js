@@ -1,5 +1,7 @@
 // server.js
+require('./polyfills'); // must precede the Baileys require — see polyfills.js
 const express = require('express');
+const fs = require('fs');
 const path = require('path');
 const {
   default: makeWASocket,
@@ -10,12 +12,12 @@ const {
   Browsers,
 } = require('@whiskeysockets/baileys');
 const { getAIResponse } = require('./ai');
-const { initMatch } = require('./match');
+const { initMatch, handleAcceptCode } = require('./match');
 const { WebSocketServer } = require('ws');
 const { startReminderScheduler } = require('./reminder');
+const uniportal = require('./uniportal');
 const {
   initNotifications,
-  startRealtimeSubscription,
   stopRealtimeSubscription,
   getRecentAlerts,
   markAlertRead,
@@ -24,22 +26,125 @@ const {
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const AUTH_DIR = 'auth_info_baileys';
-const KEEP_ALIVE_MS = 10000;
+const AUTH_DIR = process.env.AUTH_DIR || 'auth_info_baileys';
+const SERVICE_TOKEN = process.env.UNIPORTAL_SERVICE_TOKEN || '';
+const KEEP_ALIVE_MS = 30000;
 const TRIGGER_KEYWORD = 'heybot';
 const CONVERSATION_TIMEOUT = 30 * 60 * 1000; // 30 min
 
+/* ============================
+   Connection state
+============================= */
+let sock = null;
+let saveCreds = null;
+let isStarting = false;
+let shouldStop = false;
+let botJid = null;
+let isRegistered = false;         // true once this device is paired
+let activeConversations = new Map();
+let reconnectAttempt = 0;
+const MAX_RECONNECT_DELAY = 60000;
+let lastQr = null;
+let lastQrAt = 0;
+let connectionStatus = 'disconnected';
+let reconnectTimer = null;
+let qrWatchdogTimer = null;
+let presenceTimer = null;
+let sweepTimer = null;
+
+/**
+ * WhatsApp rotates the pairing QR roughly every 20s and Baileys closes the
+ * socket once its refs are spent. Anything older than this is unscannable, so
+ * we stop advertising it rather than showing the user a dead code.
+ */
+const QR_MAX_AGE_MS = 60_000;
+
+function currentQr() {
+  if (!lastQr) return null;
+  return Date.now() - lastQrAt < QR_MAX_AGE_MS ? lastQr : null;
+}
+
+/* ============================
+   HTTP
+============================= */
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
+
 app.get('/health', (req, res) => res.json({ ok: true }));
+
 app.get('/api/status', (req, res) => res.json({
   ok: true,
   connectionStatus,
-  hasQr: !!lastQr,
+  hasQr: !!currentQr(),
+  registered: isRegistered,
   wsClients: wss?.clients?.size ?? 0,
   botJid: botJid ? '***' : null,
+  uniportalBridge: uniportal.isConfigured(),
   uptime: process.uptime(),
 }));
+
+/**
+ * Polling fallback for the QR. The dashboard prefers the WebSocket, but a
+ * proxy that buffers or drops upgrades would otherwise leave the operator with
+ * no way to see a code at all.
+ */
+app.get('/api/qr', (req, res) => {
+  const qr = currentQr();
+  res.json({ ok: true, qr, connectionStatus, registered: isRegistered });
+});
+
+/** Force a fresh pairing attempt without restarting the process. */
+app.post('/api/restart', async (req, res) => {
+  console.log('🔁 Restart requested via API');
+  clearReconnect();
+  await teardownSocket();
+  lastQr = null;
+  connectionStatus = 'disconnected';
+  broadcast({ type: 'status', status: 'restarting' });
+  scheduleReconnect(250);
+  res.json({ ok: true });
+});
+
+/** Drop the stored session so the next connect issues a brand-new QR. */
+app.post('/api/logout', async (req, res) => {
+  console.log('🚪 Logout requested via API — clearing stored session');
+  clearReconnect();
+  try { if (sock) await sock.logout().catch(() => {}); } catch {}
+  await teardownSocket();
+  clearAuthState();
+  lastQr = null;
+  isRegistered = false;
+  connectionStatus = 'disconnected';
+  broadcast({ type: 'status', status: 'disconnected' });
+  scheduleReconnect(250);
+  res.json({ ok: true });
+});
+
+/**
+ * Outbound send, called by uniportal-server to mirror a student's notification
+ * onto WhatsApp. Service-token protected: without it, anyone who can reach this
+ * port could message every linked student.
+ */
+app.post('/api/send', async (req, res) => {
+  const provided = req.get('x-service-token') || '';
+  if (!SERVICE_TOKEN || provided !== SERVICE_TOKEN) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+  const { jid, text } = req.body || {};
+  if (!jid || !text) {
+    return res.status(400).json({ ok: false, error: 'jid and text are required' });
+  }
+  if (connectionStatus !== 'connected' || !sock) {
+    return res.status(503).json({ ok: false, error: 'whatsapp not connected' });
+  }
+  try {
+    await sock.sendMessage(normalizeJid(jid), { text: String(text) });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('❌ /api/send failed:', err.message);
+    res.status(502).json({ ok: false, error: err.message });
+  }
+});
 
 /* ============================
    Notification REST API
@@ -56,8 +161,7 @@ app.get('/api/notifications', async (req, res) => {
 
 app.post('/api/notifications/:id/read', async (req, res) => {
   try {
-    const success = await markAlertRead(req.params.id);
-    res.json({ ok: success });
+    res.json({ ok: await markAlertRead(req.params.id) });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -65,8 +169,7 @@ app.post('/api/notifications/:id/read', async (req, res) => {
 
 app.post('/api/notifications/:id/dismiss', async (req, res) => {
   try {
-    const success = await dismissAlert(req.params.id);
-    res.json({ ok: success });
+    res.json({ ok: await dismissAlert(req.params.id) });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -79,19 +182,21 @@ const server = app.listen(PORT, () => {
 const wss = new WebSocketServer({ server });
 function broadcast(data) {
   const str = JSON.stringify(data);
-  wss.clients.forEach(client => {
+  wss.clients.forEach((client) => {
     if (client.readyState === 1) client.send(str);
   });
 }
 wss.on('connection', (client) => {
+  const qr = currentQr();
   if (connectionStatus === 'connected') {
     client.send(JSON.stringify({ type: 'status', status: 'connected' }));
-  } else if (lastQr) {
-    client.send(JSON.stringify({ type: 'qr', qr: lastQr }));
+  } else if (qr) {
+    client.send(JSON.stringify({ type: 'qr', qr }));
   } else {
     client.send(JSON.stringify({ type: 'status', status: connectionStatus }));
   }
 });
+
 /* ============================
    Utils
 ============================= */
@@ -103,26 +208,46 @@ function normalizeJid(jid) {
     return jid;
   }
 }
-/* ============================
-   State
-============================= */
-let sock = null;
-let saveCreds = null;
-let isStarting = false;
-let shouldStop = false;
-let botJid = null;
-let activeConversations = new Map();
-let reconnectAttempt = 0;
-const MAX_RECONNECT_DELAY = 60000;
-let lastQr = null;
-let connectionStatus = 'disconnected';
-let qrPendingScan = false; // true when QR is displayed and waiting for user to scan
-let reconnectTimer = null;
-let qrWatchdogTimer = null;
-let keepAliveStarted = false;
+
+/** Baileys' socket wrapper exposes isOpen/isClosed — it has no `readyState`. */
+function socketIsOpen() {
+  return Boolean(sock?.ws?.isOpen);
+}
+
+/**
+ * Detach and close the live socket.
+ *
+ * Every reconnect MUST come through here. The previous implementation guarded
+ * teardown behind `sock.ws.readyState === 1`, a property Baileys' WebSocketClient
+ * does not have, so the check was always false and the old socket was never
+ * closed: each reconnect leaked a socket that kept its event handlers, which is
+ * why messages got answered two or three times and the connection kept dropping.
+ */
+async function teardownSocket() {
+  if (!sock) return;
+  const dying = sock;
+  sock = null;
+  try { dying.ev.removeAllListeners(); } catch {}
+  try { dying.end(new Error('socket replaced')); } catch {}
+}
+
+function clearAuthState() {
+  try {
+    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+    console.log('🗑️  Cleared stored auth state');
+  } catch (err) {
+    console.warn('Could not clear auth state:', err.message);
+  }
+}
+
+function clearReconnect() {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (qrWatchdogTimer) { clearTimeout(qrWatchdogTimer); qrWatchdogTimer = null; }
+}
 
 function scheduleReconnect(delay) {
   if (reconnectTimer || shouldStop) return;
+  console.log(`⏭️  Next connect attempt in ${Math.round(delay / 1000)}s`);
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     isStarting = false;
@@ -176,8 +301,7 @@ function isBotRepliedTo(message, botJid) {
 function isConversationActive(conversationKey) {
   const conversation = activeConversations.get(conversationKey);
   if (!conversation) return false;
-  const now = Date.now();
-  const isActive = now - conversation.lastActivity < CONVERSATION_TIMEOUT;
+  const isActive = Date.now() - conversation.lastActivity < CONVERSATION_TIMEOUT;
   if (!isActive) {
     activeConversations.delete(conversationKey);
     console.log(`⏰ Conversation timeout: ${conversationKey}`);
@@ -194,6 +318,96 @@ function updateConversationActivity(conversationKey) {
 }
 
 /* ============================
+   uniportal account linking
+   A student connects here exactly as they do in the app: they prove the
+   university email (the code is mailed to the address on their record) and the
+   WhatsApp number (the code comes back from it).
+============================= */
+const LINK_HELP =
+  '🔗 To connect your student account, send:\n\n*link your.name@university.ac.uk*\n\n' +
+  "I'll email a 6-digit code to that address — reply with the code here.";
+
+function looksLikeLinkCommand(text) {
+  return /^link\b/i.test((text || '').trim());
+}
+
+function extractLinkEmail(text) {
+  const m = (text || '').trim().match(/^link\b[:\s]+(\S+@\S+\.\S+)$/i);
+  return m ? m[1].toLowerCase() : null;
+}
+
+function isSixDigitCode(text) {
+  return /^\d{6}$/.test((text || '').trim());
+}
+
+/** Numbers we have mailed a code to, so a bare 6-digit reply is unambiguous. */
+const awaitingCode = new Map();
+const AWAITING_CODE_TTL = 15 * 60 * 1000;
+
+function markAwaitingCode(jid) {
+  awaitingCode.set(jid, Date.now());
+}
+function isAwaitingCode(jid) {
+  const at = awaitingCode.get(jid);
+  if (!at) return false;
+  if (Date.now() - at > AWAITING_CODE_TTL) {
+    awaitingCode.delete(jid);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Returns a reply string when the message was part of the linking flow, or null
+ * to let normal AI handling take over.
+ */
+async function handleLinking(jid, text) {
+  if (!uniportal.isConfigured()) {
+    return looksLikeLinkCommand(text)
+      ? '⚠️ Account connection is not available right now. Please try again later.'
+      : null;
+  }
+
+  if (looksLikeLinkCommand(text)) {
+    const email = extractLinkEmail(text);
+    if (!email) return LINK_HELP;
+    try {
+      await uniportal.startLink(jid, email);
+      markAwaitingCode(jid);
+      // Deliberately uniform: we never confirm whether an address belongs to a
+      // real student, so this can't be used to enumerate them.
+      return `📧 If *${email}* belongs to a student account, a 6-digit code is on its way.\n\nReply with the code to finish connecting.`;
+    } catch (err) {
+      console.error('link start failed:', err.message);
+      return '⚠️ Something went wrong sending your code. Please try again in a moment.';
+    }
+  }
+
+  if (isSixDigitCode(text) && isAwaitingCode(jid)) {
+    try {
+      const result = await uniportal.verifyLink(jid, text.trim());
+      if (result?.ok) {
+        awaitingCode.delete(jid);
+        const name = result.name ? `, ${result.name}` : '';
+        return `✅ Connected${name}! Your university updates and alerts will now reach you here as well as in the app.\n\nSend *unlink* any time to stop.`;
+      }
+      const reason = {
+        expired: '⌛ That code has expired. Send *link your@email* to get a new one.',
+        too_many_attempts: '🚫 Too many attempts. Send *link your@email* to start again.',
+        wrong_code: "❌ That code doesn't match. Check the email and try again.",
+        no_request: 'ℹ️ I have no pending connection for this number. Send *link your@email* to start.',
+      }[result?.reason];
+      return reason || '❌ Could not verify that code.';
+    } catch (err) {
+      console.error('link verify failed:', err.message);
+      return '⚠️ Something went wrong checking your code. Please try again.';
+    }
+  }
+
+  return null;
+}
+
+/* ============================
    Bot start
 ============================= */
 async function startBot() {
@@ -201,22 +415,19 @@ async function startBot() {
   isStarting = true;
 
   try {
-    const stateRes = await useMultiFileAuthState(AUTH_DIR);
-    const { state, saveCreds: _saveCreds } = stateRes;
+    const { state, saveCreds: _saveCreds } = await useMultiFileAuthState(AUTH_DIR);
     saveCreds = _saveCreds;
+    isRegistered = Boolean(state.creds?.registered);
 
-    if (sock) {
-      try { sock.ev.removeAllListeners(); } catch {}
-      try { if (sock.ws && sock.ws.readyState === 1) await sock.end(); } catch {}
-      sock = null;
-    }
+    await teardownSocket();
 
-    // Always fetch the live WhatsApp Web version — using a stale version causes 405 handshake errors
+    // Always fetch the live WhatsApp Web version — a stale one is rejected with
+    // a 405 handshake error and no QR is ever produced.
     let version;
     try {
       const v = await fetchLatestBaileysVersion();
       version = v.version;
-      console.log(`\ud83d\udce6 Using WhatsApp Web version ${version.join('.')} (latest: ${v.isLatest})`);
+      console.log(`📦 Using WhatsApp Web version ${version.join('.')} (latest: ${v.isLatest})`);
     } catch (e) {
       console.warn('Could not fetch latest WA version, using Baileys default:', e.message);
     }
@@ -225,106 +436,60 @@ async function startBot() {
       auth: state,
       version,
       keepAliveIntervalMs: KEEP_ALIVE_MS,
-      // Use a standard browser tuple — custom names trigger 405 handshake rejections
+      // A standard browser tuple — custom names trigger 405 handshake rejections.
       browser: Browsers.ubuntu('Chrome'),
-      printQRInTerminal: false,
       syncFullHistory: false,
       markOnlineOnConnect: false,
     });
 
-    if (qrWatchdogTimer) { clearTimeout(qrWatchdogTimer); qrWatchdogTimer = null; }
-    // QR watchdog — if no QR or connection within 60s, clear stale auth and retry
-    qrWatchdogTimer = setTimeout(() => {
-      qrWatchdogTimer = null;
-      if (connectionStatus === 'connected' || lastQr || qrPendingScan) return;
-      console.warn('\u26a0\ufe0f  No QR generated within 60s — clearing stale auth and retrying...');
-      try { sock?.ev?.removeAllListeners(); } catch {}
-      try { if (sock?.ws?.readyState === 1) sock.end(); } catch {}
-      const fs = require('fs');
-      try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch {}
-      scheduleReconnect(2000);
-    }, 60000);
+    armQrWatchdog();
 
     /* === init match system with send + createGroup === */
-initMatch({
-  send: async (jid, content) => {
-    if (typeof content === "string") {
-      await sock.sendMessage(jid, { text: content });
-    } else {
-      await sock.sendMessage(jid, content); // allow buttons, lists, etc
-    }
-  },
-  createGroup: async (subject, jids) => await sock.groupCreate(subject, jids),
-});
-
+    initMatch({
+      send: async (jid, content) => {
+        if (typeof content === 'string') {
+          await sock.sendMessage(jid, { text: content });
+        } else {
+          await sock.sendMessage(jid, content); // allow buttons, lists, etc
+        }
+      },
+      createGroup: async (subject, jids) => await sock.groupCreate(subject, jids),
+    });
 
     sock.ev.on('connection.update', (update) => {
-      console.log('🔔 connection.update:', JSON.stringify(Object.keys(update)));
       const { connection, lastDisconnect, qr } = update;
+
       if (qr) {
-        if (qrWatchdogTimer) { clearTimeout(qrWatchdogTimer); qrWatchdogTimer = null; }
+        clearWatchdog();
         lastQr = qr;
-        qrPendingScan = true;
-        connectionStatus = 'disconnected';
+        lastQrAt = Date.now();
+        connectionStatus = 'qr';
         broadcast({ type: 'qr', qr });
-        console.log('\ud83d\udcf7 New QR generated — broadcast to', wss.clients.size, 'client(s). Waiting for scan...');
+        console.log(`📷 QR ready — sent to ${wss.clients.size} dashboard client(s). Waiting for scan...`);
       }
+
       if (connection === 'open') {
-        if (qrWatchdogTimer) { clearTimeout(qrWatchdogTimer); qrWatchdogTimer = null; }
+        clearWatchdog();
         console.log('✅ WhatsApp connected');
         reconnectAttempt = 0;
-        lastQr = null;        qrPendingScan = false;        connectionStatus = 'connected';
-        botJid = sock.user.id;
+        lastQr = null;
+        isRegistered = true;
+        connectionStatus = 'connected';
+        botJid = normalizeJid(sock.user?.id);
         console.log('🤖 Bot JID:', botJid);
         broadcast({ type: 'status', status: 'connected' });
 
-        // Start real-time notification system
+        // The WhatsApp sender is wired up for outbound alerts. The old
+        // Supabase realtime fan-out is intentionally NOT started: it pushed
+        // every alert to every registered number regardless of which student
+        // (or which university) it concerned. Alerts now arrive per-recipient
+        // from uniportal-server via POST /api/send.
         initNotifications({
-          send: async (jid, text) => {
-            await sock.sendMessage(jid, { text });
-          },
+          send: async (jid, text) => { await sock.sendMessage(jid, { text }); },
           broadcast,
         });
-        startRealtimeSubscription();
       } else if (connection === 'close') {
-        const reason = lastDisconnect?.error?.output?.statusCode;
-        const isLoggedOut = reason === DisconnectReason.loggedOut;
-        console.log('🔌 Connection closed.', reason, 'loggedOut:', isLoggedOut);
-        connectionStatus = 'disconnected';
-        broadcast({ type: 'status', status: 'disconnected', reason });
-
-        if (qrWatchdogTimer) { clearTimeout(qrWatchdogTimer); qrWatchdogTimer = null; }
-
-        // 515 = restart required (normal right after first successful pairing) — reconnect immediately
-        const isRestartRequired = reason === DisconnectReason.restartRequired || reason === 515;
-        if (isRestartRequired) {
-          console.log('\ud83d\udd01 Restart required after pairing — reconnecting immediately...');
-          lastQr = null;
-          qrPendingScan = false;
-          reconnectAttempt = 0;
-          scheduleReconnect(500);
-          return;
-        }
-
-        // If QR is pending scan, DON'T reconnect — just wait for user to scan
-        if (qrPendingScan && !isLoggedOut) {
-          console.log('\u23f3 QR is pending scan — not reconnecting. Open the dashboard to scan.');
-          lastQr = null;
-          qrPendingScan = false;
-          scheduleReconnect(60000); // 60s cooldown before next QR attempt
-          return;
-        }
-
-        lastQr = null;
-        qrPendingScan = false;
-        if (!isLoggedOut) {
-          reconnectAttempt++;
-          const delay = Math.min(2000 * Math.pow(1.5, reconnectAttempt - 1), MAX_RECONNECT_DELAY);
-          console.log(`🔄 Reconnecting in ${Math.round(delay / 1000)}s (attempt ${reconnectAttempt})...`);
-          scheduleReconnect(delay);
-        } else {
-          console.log('❌ Logged out — restart with new QR.');
-        }
+        handleDisconnect(lastDisconnect);
       } else if (connection === 'connecting') {
         console.log('🔄 WhatsApp connecting...');
         connectionStatus = 'connecting';
@@ -333,103 +498,9 @@ initMatch({
     });
 
     sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('messages.upsert', onMessages);
 
-    /* === Handle messages === */
-    sock.ev.on('messages.upsert', async ({ messages }) => {
-      try {
-        if (!messages?.[0] || messages[0].key.fromMe) return;
-        const msg = messages[0];
-        const remoteJid = normalizeJid(msg.key.remoteJid || '');
-        const isGroup = remoteJid.endsWith('@g.us');
-        const groupId = isGroup ? remoteJid : null;
-        const participantId = normalizeJid(msg.key.participant || remoteJid);
-        const senderId = isGroup ? participantId : remoteJid;
-        const userId = isGroup ? participantId : remoteJid;
-
-        const conversationKey = isGroup ? `${remoteJid}_${participantId}` : remoteJid;
-        /* === Catch Accept button === */
-        if (msg.message?.buttonsResponseMessage?.selectedButtonId?.startsWith("ACCEPT_")) {
-          const code = msg.message.buttonsResponseMessage.selectedButtonId.replace("ACCEPT_", "");
-          const reply = await handleAcceptCode(userId, code);
-          await sock.sendMessage(userId, { text: reply });
-          return;
-        }
-        let text = extractTextFromMessage(msg.message);
-        if (text) text = text.trim();
-
-        let shouldRespond = false;
-        let sendPrivately = false;
-        let isNewConversation = false;
-
-        if (isGroup) {
-          const conversationActive = isConversationActive(conversationKey);
-          const startsWithTrigger = text?.toLowerCase().startsWith(TRIGGER_KEYWORD.toLowerCase());
-          if (startsWithTrigger) {
-            if (!conversationActive) { startConversation(conversationKey); isNewConversation = true; }
-            shouldRespond = true;
-            text = text.slice(TRIGGER_KEYWORD.length).trim();
-            console.log(`🎯 Trigger in ${groupId} by ${participantId}`);
-          } else if (conversationActive) {
-            const isMentioned = isBotMentioned(msg.message, botJid);
-            const isRepliedTo = isBotRepliedTo(msg.message, botJid);
-            if (isMentioned || isRepliedTo) {
-              shouldRespond = true;
-              updateConversationActivity(conversationKey);
-              console.log(`🎯 Bot ${isMentioned ? 'mentioned' : 'replied'} in ${conversationKey}`);
-              if (isMentioned && text) text = text.replace(/@\d+/g, '').trim();
-            }
-          }
-          if (shouldRespond && /reply\s+me\s+privately|dm\s+me|private\s+reply/i.test(text)) {
-            sendPrivately = true;
-            text = text.replace(/reply\s+me\s+privately|dm\s+me|private\s+reply/gi, '').trim();
-          }
-        } else {
-          if (!isConversationActive(conversationKey)) { startConversation(conversationKey); isNewConversation = true; }
-          else updateConversationActivity(conversationKey);
-          shouldRespond = true;
-          console.log(`💬 Private message from ${senderId}`);
-        }
-
-        if (!shouldRespond) return;
-
-        // Important: pass full msg if no text (to capture locationMessage)
-        const inputForAI = text || msg;
-        console.log(`🤖 Processing: "${text || '[non-text message]'}" ${isNewConversation ? '(New)' : '(Cont.)'}`);
-        const aiReply = await getAIResponse(userId, inputForAI);
-
-        if (isGroup) {
-          if (sendPrivately) {
-            await sock.sendMessage(senderId, { text: aiReply });
-            console.log(`📤 Private reply to ${senderId}`);
-          } else {
-            await sock.sendMessage(groupId, { text: aiReply });
-            console.log(`📤 Group reply to ${groupId}`);
-          }
-        } else {
-          await sock.sendMessage(senderId, { text: aiReply });
-          console.log(`📤 Private reply to ${senderId}`);
-        }
-      } catch (err) {
-        console.error('messages.upsert error:', err);
-      }
-    });
-
-    /* === Keep alive / presence / cleanup (started once globally) === */
-    if (!keepAliveStarted) {
-      keepAliveStarted = true;
-      setInterval(() => { try { if (sock?.ws && sock.ws.readyState === 1) sock.ws.ping(); } catch {} }, 30000);
-      setInterval(async () => { try { if (sock?.user) await sock.sendPresenceUpdate('available'); } catch {} }, 60000);
-      setInterval(() => {
-        const now = Date.now();
-        for (const [key, conv] of activeConversations.entries()) {
-          if (now - conv.lastActivity >= CONVERSATION_TIMEOUT) {
-            activeConversations.delete(key);
-            console.log(`🧹 Expired conversation: ${key}`);
-          }
-        }
-      }, 5 * 60 * 1000);
-    }
-
+    startBackgroundTimers();
     console.log('Bot started.');
   } catch (err) {
     console.error('startBot error:', err);
@@ -439,18 +510,220 @@ initMatch({
   }
 }
 
+/* ============================
+   Disconnect handling
+============================= */
+function handleDisconnect(lastDisconnect) {
+  const reason = lastDisconnect?.error?.output?.statusCode;
+  const isLoggedOut = reason === DisconnectReason.loggedOut;
+  console.log('🔌 Connection closed. reason:', reason, 'loggedOut:', isLoggedOut);
+
+  connectionStatus = 'disconnected';
+  clearWatchdog();
+  broadcast({ type: 'status', status: 'disconnected', reason });
+
+  // 515: WhatsApp requires a reconnect immediately after a successful pairing.
+  if (reason === DisconnectReason.restartRequired || reason === 515) {
+    console.log('🔁 Restart required after pairing — reconnecting immediately...');
+    lastQr = null;
+    reconnectAttempt = 0;
+    scheduleReconnect(500);
+    return;
+  }
+
+  // Logged out from the phone: the stored session is dead. Wipe it and come
+  // straight back with a fresh QR instead of sitting idle until someone
+  // restarts the process by hand.
+  if (isLoggedOut) {
+    console.log('❌ Logged out — clearing session and preparing a new QR.');
+    clearAuthState();
+    isRegistered = false;
+    lastQr = null;
+    reconnectAttempt = 0;
+    scheduleReconnect(1000);
+    return;
+  }
+
+  // Unpaired socket timed out: WhatsApp expired the pairing QR. Reconnect at
+  // once for a new one. The previous code nulled the QR and waited a full
+  // minute here, so the dashboard sat on "waiting for QR" and the code could
+  // never be scanned — the reported "QR won't generate" symptom.
+  if (!isRegistered) {
+    lastQr = null;
+    console.log('⌛ Pairing code expired — requesting a fresh QR...');
+    scheduleReconnect(1000);
+    return;
+  }
+
+  lastQr = null;
+  reconnectAttempt++;
+  const delay = Math.min(2000 * Math.pow(1.5, reconnectAttempt - 1), MAX_RECONNECT_DELAY);
+  console.log(`🔄 Reconnecting (attempt ${reconnectAttempt})...`);
+  scheduleReconnect(delay);
+}
+
+/* ============================
+   QR watchdog
+   Only ever fires for an UNPAIRED socket that produced no QR at all. A paired
+   session never emits one, so the old unconditional watchdog deleted working
+   credentials whenever a reconnect ran slow — forcing a re-scan for no reason.
+============================= */
+function clearWatchdog() {
+  if (qrWatchdogTimer) { clearTimeout(qrWatchdogTimer); qrWatchdogTimer = null; }
+}
+
+function armQrWatchdog() {
+  clearWatchdog();
+  qrWatchdogTimer = setTimeout(() => {
+    qrWatchdogTimer = null;
+    if (connectionStatus === 'connected' || currentQr()) return;
+
+    if (isRegistered) {
+      console.warn('⚠️  Paired session has not connected in 60s — retrying (session kept).');
+      teardownSocket().then(() => scheduleReconnect(2000));
+      return;
+    }
+
+    console.warn('⚠️  No QR within 60s on an unpaired socket — clearing partial state and retrying.');
+    teardownSocket().then(() => {
+      clearAuthState();
+      scheduleReconnect(2000);
+    });
+  }, 60000);
+}
+
+/* ============================
+   Background timers (started once)
+============================= */
+let timersStarted = false;
+function startBackgroundTimers() {
+  if (timersStarted) return;
+  timersStarted = true;
+
+  // Baileys handles its own websocket keep-alive (keepAliveIntervalMs); the
+  // previous `sock.ws.ping()` call threw on every tick because the wrapper has
+  // no ping method. Presence is enough to look alive to WhatsApp.
+  presenceTimer = setInterval(async () => {
+    try { if (socketIsOpen() && sock?.user) await sock.sendPresenceUpdate('available'); } catch {}
+  }, 60000);
+
+  sweepTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [key, conv] of activeConversations.entries()) {
+      if (now - conv.lastActivity >= CONVERSATION_TIMEOUT) {
+        activeConversations.delete(key);
+        console.log(`🧹 Expired conversation: ${key}`);
+      }
+    }
+    for (const [jid, at] of awaitingCode.entries()) {
+      if (now - at > AWAITING_CODE_TTL) awaitingCode.delete(jid);
+    }
+  }, 5 * 60 * 1000);
+}
+
+/* ============================
+   Messages
+============================= */
+async function onMessages({ messages }) {
+  try {
+    if (!messages?.[0] || messages[0].key.fromMe) return;
+    const msg = messages[0];
+    const remoteJid = normalizeJid(msg.key.remoteJid || '');
+    if (!remoteJid) return;
+    const isGroup = remoteJid.endsWith('@g.us');
+    const groupId = isGroup ? remoteJid : null;
+    const participantId = normalizeJid(msg.key.participant || remoteJid);
+    const senderId = isGroup ? participantId : remoteJid;
+    const userId = isGroup ? participantId : remoteJid;
+
+    const conversationKey = isGroup ? `${remoteJid}_${participantId}` : remoteJid;
+
+    /* === Catch Accept button === */
+    if (msg.message?.buttonsResponseMessage?.selectedButtonId?.startsWith('ACCEPT_')) {
+      const code = msg.message.buttonsResponseMessage.selectedButtonId.replace('ACCEPT_', '');
+      const reply = await handleAcceptCode(userId, code);
+      await sock.sendMessage(userId, { text: reply });
+      return;
+    }
+
+    let text = extractTextFromMessage(msg.message);
+    if (text) text = text.trim();
+
+    let shouldRespond = false;
+    let sendPrivately = false;
+    let isNewConversation = false;
+
+    if (isGroup) {
+      const conversationActive = isConversationActive(conversationKey);
+      const startsWithTrigger = text?.toLowerCase().startsWith(TRIGGER_KEYWORD.toLowerCase());
+      if (startsWithTrigger) {
+        if (!conversationActive) { startConversation(conversationKey); isNewConversation = true; }
+        shouldRespond = true;
+        text = text.slice(TRIGGER_KEYWORD.length).trim();
+        console.log(`🎯 Trigger in ${groupId} by ${participantId}`);
+      } else if (conversationActive) {
+        const isMentioned = isBotMentioned(msg.message, botJid);
+        const isRepliedTo = isBotRepliedTo(msg.message, botJid);
+        if (isMentioned || isRepliedTo) {
+          shouldRespond = true;
+          updateConversationActivity(conversationKey);
+          console.log(`🎯 Bot ${isMentioned ? 'mentioned' : 'replied'} in ${conversationKey}`);
+          if (isMentioned && text) text = text.replace(/@\d+/g, '').trim();
+        }
+      }
+      if (shouldRespond && /reply\s+me\s+privately|dm\s+me|private\s+reply/i.test(text)) {
+        sendPrivately = true;
+        text = text.replace(/reply\s+me\s+privately|dm\s+me|private\s+reply/gi, '').trim();
+      }
+    } else {
+      // Account linking is a private-chat flow only: a code sent into a group
+      // would be readable by everyone in it.
+      const linkReply = await handleLinking(senderId, text);
+      if (linkReply) {
+        await sock.sendMessage(senderId, { text: linkReply });
+        return;
+      }
+
+      if (!isConversationActive(conversationKey)) { startConversation(conversationKey); isNewConversation = true; }
+      else updateConversationActivity(conversationKey);
+      shouldRespond = true;
+      console.log(`💬 Private message from ${senderId}`);
+    }
+
+    if (!shouldRespond) return;
+
+    // Pass the full message when there is no text (captures locationMessage).
+    const inputForAI = text || msg;
+    console.log(`🤖 Processing: "${text || '[non-text message]'}" ${isNewConversation ? '(New)' : '(Cont.)'}`);
+    const aiReply = await getAIResponse(userId, inputForAI);
+
+    const target = isGroup ? (sendPrivately ? senderId : groupId) : senderId;
+    await sock.sendMessage(target, { text: aiReply });
+    console.log(`📤 Reply to ${target}`);
+  } catch (err) {
+    console.error('messages.upsert error:', err);
+  }
+}
+
 startBot();
 
 /* === Reminders === */
 startReminderScheduler(async (userId, text) => {
+  if (!socketIsOpen()) throw new Error('WhatsApp not connected');
   await sock.sendMessage(userId, { text });
 });
 
 /* === Graceful shutdown === */
-process.on('SIGINT', async () => {
+async function shutdown() {
   console.log('\n👋 Shutting down...');
   shouldStop = true;
-  await stopRealtimeSubscription();
-  try { if (sock && sock.ws && sock.ws.readyState === 1) await sock.end(); } catch {}
+  clearReconnect();
+  if (presenceTimer) clearInterval(presenceTimer);
+  if (sweepTimer) clearInterval(sweepTimer);
+  await stopRealtimeSubscription().catch(() => {});
+  await teardownSocket();
   server.close(() => process.exit(0));
-});
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);

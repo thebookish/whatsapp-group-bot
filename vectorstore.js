@@ -4,18 +4,30 @@ const { supabase, DATA_FILE, OPENROUTER_API_KEY } = require("./config");
 const OpenAI = require("openai");
 
 /* ============================
-   OpenAI Client
+   OpenAI Client (lazy)
+
+   Constructed on first use, not at module load. `new OpenAI()` throws when no
+   key is configured, and this module is pulled in by rag.js → ai.js →
+   server.js — so building it eagerly killed the whole process during require,
+   before Express ever listened. A missing key must degrade search, not take
+   WhatsApp connectivity down with it.
 ============================= */
-const openai = new OpenAI({
-  apiKey: OPENROUTER_API_KEY, // keep same env variable
-});
+let _openai;
+function openaiClient() {
+  if (_openai) return _openai;
+  if (!OPENROUTER_API_KEY) {
+    throw new Error('OPENROUTER_API_KEY is not set — embeddings unavailable.');
+  }
+  _openai = new OpenAI({ apiKey: OPENROUTER_API_KEY }); // keep same env variable
+  return _openai;
+}
 
 /* ============================
    Batch embeddings
 ============================= */
 async function getEmbeddingsBatch(texts) {
   try {
-    const res = await openai.embeddings.create({
+    const res = await openaiClient().embeddings.create({
       model: "text-embedding-3-small",
       input: texts,
     });
