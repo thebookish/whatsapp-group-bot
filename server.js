@@ -80,6 +80,8 @@ app.get('/api/status', (req, res) => res.json({
   wsClients: wss?.clients?.size ?? 0,
   botJid: botJid ? '***' : null,
   uniportalBridge: uniportal.isConfigured(),
+  uniportalBridgeMissing: uniportal.missingConfig(),
+  sendEndpointReady: Boolean(SERVICE_TOKEN),
   uptime: process.uptime(),
 }));
 
@@ -177,7 +179,31 @@ app.post('/api/notifications/:id/dismiss', async (req, res) => {
 
 const server = app.listen(PORT, () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);
+  reportBridgeConfig();
 });
+
+/**
+ * State the bridge configuration at boot. Without this the only symptom of a
+ * missing env var is a student being told "not available right now" — with
+ * nothing in the logs to say why.
+ */
+function reportBridgeConfig() {
+  const missing = uniportal.missingConfig();
+  if (missing.length) {
+    console.warn(
+      `⚠️  uniportal bridge DISABLED — missing ${missing.join(' and ')}. ` +
+      'Students cannot link their account until these are set.',
+    );
+  } else {
+    console.log('🔗 uniportal bridge configured');
+  }
+  if (!SERVICE_TOKEN) {
+    console.warn(
+      '⚠️  UNIPORTAL_SERVICE_TOKEN is not set — POST /api/send will reject every ' +
+      'request, so uniportal alerts cannot be delivered to WhatsApp.',
+    );
+  }
+}
 
 const wss = new WebSocketServer({ server });
 function broadcast(data) {
@@ -362,10 +388,14 @@ function isAwaitingCode(jid) {
  * to let normal AI handling take over.
  */
 async function handleLinking(jid, text) {
-  if (!uniportal.isConfigured()) {
-    return looksLikeLinkCommand(text)
-      ? '⚠️ Account connection is not available right now. Please try again later.'
-      : null;
+  const missing = uniportal.missingConfig();
+  if (missing.length) {
+    if (!looksLikeLinkCommand(text)) return null;
+    // The student gets a neutral message; the operator gets the actual cause.
+    console.error(
+      `❌ Link attempt refused: uniportal bridge not configured (missing ${missing.join(' and ')})`,
+    );
+    return '⚠️ Account connection is not available right now. Please try again later.';
   }
 
   if (looksLikeLinkCommand(text)) {

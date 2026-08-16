@@ -7,27 +7,43 @@
 // tenant decision is made server-side against the real student registry — the
 // bot never sees another university's data.
 
-const BASE_URL = (process.env.UNIPORTAL_API_URL || '').replace(/\/$/, '');
-const SERVICE_TOKEN = process.env.UNIPORTAL_SERVICE_TOKEN || '';
 const TIMEOUT_MS = 10000;
 
+// Read lazily rather than at module load, so a platform that injects env vars
+// late (or a restart after fixing them) needs no code change to take effect.
+function baseUrl() {
+  return (process.env.UNIPORTAL_API_URL || '').trim().replace(/\/$/, '');
+}
+function serviceToken() {
+  return (process.env.UNIPORTAL_SERVICE_TOKEN || '').trim();
+}
+
+/** Names of the env vars that are missing — empty when the bridge is usable. */
+function missingConfig() {
+  const missing = [];
+  if (!baseUrl()) missing.push('UNIPORTAL_API_URL');
+  if (!serviceToken()) missing.push('UNIPORTAL_SERVICE_TOKEN');
+  return missing;
+}
+
 function isConfigured() {
-  return Boolean(BASE_URL && SERVICE_TOKEN);
+  return missingConfig().length === 0;
 }
 
 async function call(path, body) {
-  if (!isConfigured()) {
-    throw new Error('uniportal bridge not configured (UNIPORTAL_API_URL / UNIPORTAL_SERVICE_TOKEN)');
+  const missing = missingConfig();
+  if (missing.length) {
+    throw new Error(`uniportal bridge not configured \u2014 missing ${missing.join(' and ')}`);
   }
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
   try {
-    const res = await fetch(`${BASE_URL}${path}`, {
+    const res = await fetch(`${baseUrl()}${path}`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-service-token': SERVICE_TOKEN,
+        'x-service-token': serviceToken(),
       },
       body: JSON.stringify(body),
       signal: controller.signal,
@@ -64,4 +80,4 @@ async function identify(jid) {
   return call('/api/v1/whatsapp/identify', { jid });
 }
 
-module.exports = { isConfigured, startLink, verifyLink, identify };
+module.exports = { isConfigured, missingConfig, startLink, verifyLink, identify };

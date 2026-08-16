@@ -31,6 +31,22 @@ async function addReminder(userId, message, remindAt) {
 }
 
 /**
+ * Reminder polling runs every 30s, so an unreachable store used to print the
+ * same error twice a minute and bury every other log line. Report the first
+ * failure, then only every 20th (~10 minutes), then the recovery.
+ */
+let consecutiveFetchFailures = 0;
+function noteFetchFailure(detail) {
+  consecutiveFetchFailures++;
+  if (consecutiveFetchFailures === 1 || consecutiveFetchFailures % 20 === 0) {
+    console.error(
+      `❌ Error fetching reminders (failure #${consecutiveFetchFailures}):`,
+      detail,
+    );
+  }
+}
+
+/**
  * Fetch reminders that are due and not sent yet
  */
 async function getDueReminders() {
@@ -43,14 +59,18 @@ async function getDueReminders() {
       .eq('sent', false);
 
     if (error) {
-      console.error('❌ Error fetching reminders:', error);
+      noteFetchFailure(error.message || error);
       return [];
     }
 
-    console.log(`⏰ Found ${data?.length || 0} due reminders`);
+    if (consecutiveFetchFailures > 0) {
+      console.log(`✅ Reminder store reachable again after ${consecutiveFetchFailures} failure(s)`);
+      consecutiveFetchFailures = 0;
+    }
+    if (data?.length) console.log(`⏰ Found ${data.length} due reminders`);
     return data || [];
   } catch (err) {
-    console.error("❌ getDueReminders unexpected error:", err);
+    noteFetchFailure(err.message || err);
     return [];
   }
 }
