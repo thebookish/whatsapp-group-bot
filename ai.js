@@ -239,7 +239,40 @@ function formatCourseSlice(rows, start = 0, size = 5, head = "") {
 /* ============================
    Main entry with Tool Calls
 ============================= */
-async function getAIResponse(userId, rawMessage) {
+/**
+ * System prompt.
+ *
+ * When the sender has linked their WorldLynk/uniportal account, their own
+ * verified account facts are appended so the assistant can answer about their
+ * documents, milestones, tasks and obligations instead of speaking generically.
+ * Without a link there is no account section at all — an unverified chat must
+ * not be told anything about anyone.
+ */
+function buildSystemPrompt(accountContext) {
+  const base =
+    "You are a Student Assistant for WorldLynk. Use tools, not generic answers. " +
+    "Courses/unis → queryDataset. Housing → searchUKAccommodation. Reminders → addReminder. " +
+    "Connect → handleConnectIntent. Prefer calling a tool for anything you do not already know.";
+
+  if (!accountContext) {
+    return (
+      base +
+      " The person you are talking to has NOT linked their student account, so you know " +
+      "nothing about them. If they ask about their application, documents, tasks or " +
+      "university records, tell them to send: link their-university-email@example.ac.uk"
+    );
+  }
+
+  return (
+    base +
+    "\n\n" +
+    accountContext +
+    "\n\nAnswer questions about their account from those facts, in full sentences. " +
+    "Never reveal or discuss another student's information."
+  );
+}
+
+async function getAIResponse(userId, rawMessage, accountContext = null) {
   try {
     const uid = validateUserId(userId);
     let messageText =
@@ -310,8 +343,7 @@ async function getAIResponse(userId, rawMessage) {
       messages: [
         {
           role: "system",
-          content:
-            "You are a Student Assistant. Use tools, not generic answers. Courses/unis → queryDataset. Housing → searchUKAccommodation. Reminders → addReminder. Connect → handleConnectIntent. Always prefer calling a tool.",
+          content: buildSystemPrompt(accountContext),
         },
         { role: "user", content: messageText },
       ],

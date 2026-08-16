@@ -418,6 +418,7 @@ async function handleLinking(jid, text) {
       const result = await uniportal.verifyLink(jid, text.trim());
       if (result?.ok) {
         awaitingCode.delete(jid);
+        contextCache.delete(jid); // pick the new account up on the next message
         const name = result.name ? `, ${result.name}` : '';
         return `✅ Connected${name}! Your university updates and alerts will now reach you here as well as in the app.\n\nSend *unlink* any time to stop.`;
       }
@@ -435,6 +436,35 @@ async function handleLinking(jid, text) {
   }
 
   return null;
+}
+
+
+/**
+ * Account context for a linked student, cached briefly.
+ *
+ * Every message would otherwise re-read the whole account from Firestore; a
+ * short TTL keeps a normal back-and-forth to one fetch while still reflecting
+ * a document approval or completed milestone within the same conversation.
+ */
+const contextCache = new Map();
+const CONTEXT_TTL_MS = 60 * 1000;
+
+async function accountContextFor(jid) {
+  if (!uniportal.isConfigured()) return null;
+
+  const hit = contextCache.get(jid);
+  if (hit && Date.now() - hit.at < CONTEXT_TTL_MS) return hit.summary;
+
+  try {
+    const res = await uniportal.context(jid);
+    const summary = res?.linked ? res.context?.summary ?? null : null;
+    contextCache.set(jid, { at: Date.now(), summary });
+    return summary;
+  } catch (err) {
+    // An assistant that still answers generally beats one that goes silent.
+    console.error('account context fetch failed:', err.message);
+    return null;
+  }
 }
 
 /* ============================
@@ -725,7 +755,10 @@ async function onMessages({ messages }) {
     // Pass the full message when there is no text (captures locationMessage).
     const inputForAI = text || msg;
     console.log(`🤖 Processing: "${text || '[non-text message]'}" ${isNewConversation ? '(New)' : '(Cont.)'}`);
-    const aiReply = await getAIResponse(userId, inputForAI);
+    // Only in private chats: account facts must never be read out in a group,
+    // where everyone present would see another student's details.
+    const accountContext = isGroup ? null : await accountContextFor(senderId);
+    const aiReply = await getAIResponse(userId, inputForAI, accountContext);
 
     const target = isGroup ? (sendPrivately ? senderId : groupId) : senderId;
     await sock.sendMessage(target, { text: aiReply });

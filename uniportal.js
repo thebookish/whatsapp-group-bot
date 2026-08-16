@@ -59,6 +59,11 @@ async function call(path, body) {
       err.status = res.status;
       throw err;
     }
+
+    // uniportal-server wraps every success as `{ data: ... }` via ok()/created().
+    // Returning the envelope made `result.ok` undefined, so a link that had
+    // genuinely succeeded was reported to the student as "could not verify".
+    if (json && typeof json === 'object' && 'data' in json) return json.data;
     return json;
   } finally {
     clearTimeout(timer);
@@ -80,4 +85,12 @@ async function identify(jid) {
   return call('/api/v1/whatsapp/identify', { jid });
 }
 
-module.exports = { isConfigured, missingConfig, startLink, verifyLink, identify };
+/**
+ * The linked student's own account context, for the assistant to answer from.
+ * `{ linked: false }` for an unlinked number — an unverified chat gets nothing.
+ */
+async function context(jid) {
+  return call('/api/v1/whatsapp/context', { jid });
+}
+
+module.exports = { isConfigured, missingConfig, startLink, verifyLink, identify, context };
