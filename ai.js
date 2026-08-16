@@ -9,6 +9,7 @@ const {
   upsertUserLocation,
 } = require("./match");
 const axios = require("axios");
+const uniportal = require("./uniportal");
 
 /* ============================
    OpenAI Client (lazy)
@@ -248,11 +249,110 @@ function formatCourseSlice(rows, start = 0, size = 5, head = "") {
  * Without a link there is no account section at all — an unverified chat must
  * not be told anything about anyone.
  */
+
+const LINK_REQUIRED_MESSAGE =
+  "🔗 Connect your student account first — send: link your-university-email@example.ac.uk";
+
+/**
+ * Posts staged for confirmation, keyed by jid. Held in memory on purpose: an
+ * unconfirmed draft should not outlive a restart, and a stale one is better
+ * lost than published later without the student meaning it.
+ */
+const pendingPosts = new Map();
+const PENDING_POST_TTL_MS = 10 * 60 * 1000;
+
+function stagePendingPost(jid, text, anonymous) {
+  pendingPosts.set(jid, { text, anonymous, at: Date.now() });
+}
+
+function takePendingPost(jid) {
+  const pending = pendingPosts.get(jid);
+  if (!pending) return null;
+  pendingPosts.delete(jid);
+  return Date.now() - pending.at > PENDING_POST_TTL_MS ? null : pending;
+}
+
+function hasPendingPost(jid) {
+  const pending = pendingPosts.get(jid);
+  if (!pending) return false;
+  if (Date.now() - pending.at > PENDING_POST_TTL_MS) {
+    pendingPosts.delete(jid);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Handle POST/CANCEL for a staged community post. Returns a reply when the
+ * message was a confirmation, or null to let normal handling continue.
+ */
+async function handlePendingPost(jid, text) {
+  if (!jid || !hasPendingPost(jid)) return null;
+  const answer = (text || "").trim().toLowerCase();
+
+  if (answer === "cancel" || answer === "no") {
+    pendingPosts.delete(jid);
+    return "🗑️ Discarded — nothing was posted.";
+  }
+  if (answer !== "post" && answer !== "yes") return null;
+
+  const pending = takePendingPost(jid);
+  if (!pending) return "⌛ That draft expired. Tell me what you'd like to post and I'll draft it again.";
+
+  try {
+    await uniportal.postToCommunity(jid, pending.text, pending.anonymous);
+    return "✅ Posted to the community feed.";
+  } catch (err) {
+    console.error("community post failed:", err.message);
+    return "⚠️ I couldn't publish that. Please try again shortly.";
+  }
+}
+
+/** Render a lookup result as a readable WhatsApp reply. */
+function formatLookup(result) {
+  if (!result || !Array.isArray(result.items) || result.items.length === 0) {
+    return result?.note || "I couldn't find anything matching that.";
+  }
+
+  const heading = {
+    events: "📅 Upcoming events",
+    jobs: "💼 Job listings",
+    accommodations: "🏠 Accommodation",
+    journey: "🧭 Your journey",
+  }[result.kind] || "Results";
+
+  const lines = result.items.map((item) => {
+    if (result.kind === "journey") {
+      const mark = item.status === "completed" ? "✅" : item.status === "in_progress" ? "🔄" : "⬜";
+      return `${mark} ${item.title}`;
+    }
+    if (result.kind === "events") {
+      return `• *${item.title}*${item.when ? ` — ${item.when}` : ""}${item.location ? ` @ ${item.location}` : ""}`;
+    }
+    if (result.kind === "jobs") {
+      const bits = [item.employer, item.location, item.pay].filter(Boolean).join(" · ");
+      return `• *${item.title}*${bits ? ` — ${bits}` : ""}`;
+    }
+    const bits = [item.city, item.cost ? `£${item.cost}` : null].filter(Boolean).join(" · ");
+    return `• *${item.title}*${bits ? ` — ${bits}` : ""}`;
+  });
+
+  return [heading, ...lines, result.note ? `\n${result.note}` : ""].filter(Boolean).join("\n");
+}
+
 function buildSystemPrompt(accountContext) {
   const base =
-    "You are a Student Assistant for WorldLynk. Use tools, not generic answers. " +
-    "Courses/unis → queryDataset. Housing → searchUKAccommodation. Reminders → addReminder. " +
-    "Connect → handleConnectIntent. Prefer calling a tool for anything you do not already know.";
+    "You are a Student Assistant for WorldLynk. Use tools, not generic answers.\n" +
+    "- Courses/universities → queryDataset\n" +
+    "- WorldLynk events, job listings, accommodation listings, or the student's journey " +
+    "tracker → lookupWorldlynk (this is WorldLynk's own data; prefer it)\n" +
+    "- Wider UK rental market beyond WorldLynk listings → searchUKAccommodation\n" +
+    "- Reminders → addReminder\n" +
+    "- Meeting nearby students → handleConnectIntent\n" +
+    "- Sharing something on the community feed → postToCommunity (drafts it; the student " +
+    "confirms before anything is published)\n" +
+    "Prefer calling a tool for anything you do not already know. Never invent an event, job, " +
+    "listing or milestone that a tool did not return.";
 
   if (!accountContext) {
     return (
@@ -272,7 +372,7 @@ function buildSystemPrompt(accountContext) {
   );
 }
 
-async function getAIResponse(userId, rawMessage, accountContext = null) {
+async function getAIResponse(userId, rawMessage, accountContext = null, jid = null) {
   try {
     const uid = validateUserId(userId);
     let messageText =
@@ -325,6 +425,11 @@ async function getAIResponse(userId, rawMessage, accountContext = null) {
       profile = createUserProfile();
       activeSessions.set(uid, profile);
     }
+
+    // ✅ A staged community post is awaiting POST/CANCEL — settle that first,
+    // before the model gets a chance to reinterpret a one-word reply.
+    const postReply = await handlePendingPost(jid, messageText);
+    if (postReply) return postReply;
 
     // 👋 Greeting check
     if (/^(hello|hi|hey)\b/i.test(messageText)) {
@@ -404,6 +509,48 @@ async function getAIResponse(userId, rawMessage, accountContext = null) {
             },
           },
         },
+        {
+          type: "function",
+          function: {
+            name: "lookupWorldlynk",
+            description:
+              "Look up WorldLynk data for the signed-in student: upcoming events, job listings, " +
+              "accommodation listings, or their own journey tracker progress. Use this for any " +
+              "question about what events are on, what jobs or rooms are available, or how far " +
+              "through their journey they are.",
+            parameters: {
+              type: "object",
+              properties: {
+                resource: {
+                  type: "string",
+                  enum: ["events", "jobs", "accommodations", "journey"],
+                },
+                query: {
+                  type: "string",
+                  description: "Optional keywords to filter by, e.g. a city, job type or category.",
+                },
+              },
+              required: ["resource"],
+            },
+          },
+        },
+        {
+          type: "function",
+          function: {
+            name: "postToCommunity",
+            description:
+              "Draft a post for the student to publish on the WorldLynk community feed. " +
+              "Only call this when the student clearly asks to post or share something.",
+            parameters: {
+              type: "object",
+              properties: {
+                text: { type: "string", description: "The post body, in the student's own voice." },
+                anonymous: { type: "boolean" },
+              },
+              required: ["text"],
+            },
+          },
+        },
       ],
       tool_choice: "auto",
       temperature: 0,
@@ -444,6 +591,24 @@ async function getAIResponse(userId, rawMessage, accountContext = null) {
             }
             case "handleConnectIntent": {
               return await handleConnectIntent({ requesterId: uid, ...args });
+            }
+            case "lookupWorldlynk": {
+              if (!jid) return LINK_REQUIRED_MESSAGE;
+              const result = await uniportal.lookup(jid, args.resource, args.query);
+              return formatLookup(result);
+            }
+            case "postToCommunity": {
+              if (!jid) return LINK_REQUIRED_MESSAGE;
+              // Never publish straight from a model call. The student sees the
+              // exact text and confirms it first — an LLM misreading "tell the
+              // group" as an instruction to post would otherwise publish under
+              // their name with no way to take it back.
+              stagePendingPost(jid, args.text, args.anonymous === true);
+              return (
+                `📝 Here's your post:\n\n"${args.text}"\n\n` +
+                (args.anonymous === true ? "_Posted anonymously._\n\n" : "") +
+                "Reply *POST* to publish it, or *CANCEL* to discard."
+              );
             }
             default:
               return "❌ I didn’t understand the tool request.";

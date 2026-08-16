@@ -93,4 +93,23 @@ async function context(jid) {
   return call('/api/v1/whatsapp/context', { jid });
 }
 
-module.exports = { isConfigured, missingConfig, startLink, verifyLink, identify, context };
+/** Read-only lookup of WorldLynk data on behalf of a linked student. */
+async function lookup(jid, resource, query) {
+  return call('/api/v1/whatsapp/lookup', { jid, resource, query });
+}
+
+/** Publish a community post authored by the linked student. */
+async function postToCommunity(jid, text, anonymous = false) {
+  return call('/api/v1/whatsapp/community-post', { jid, text, anonymous });
+}
+
+module.exports = {
+  isConfigured,
+  missingConfig,
+  startLink,
+  verifyLink,
+  identify,
+  context,
+  lookup,
+  postToCommunity,
+};

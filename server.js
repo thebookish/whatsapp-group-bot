@@ -758,7 +758,7 @@ async function onMessages({ messages }) {
     // Only in private chats: account facts must never be read out in a group,
     // where everyone present would see another student's details.
     const accountContext = isGroup ? null : await accountContextFor(senderId);
-    const aiReply = await getAIResponse(userId, inputForAI, accountContext);
+    const aiReply = await getAIResponse(userId, inputForAI, accountContext, isGroup ? null : senderId);
 
     const target = isGroup ? (sendPrivately ? senderId : groupId) : senderId;
     await sock.sendMessage(target, { text: aiReply });
