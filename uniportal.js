@@ -98,6 +98,11 @@ async function lookup(jid, resource, query) {
   return call('/api/v1/whatsapp/lookup', { jid, resource, query });
 }
 
+/** Take an action as the linked student (complete milestone, RSVP, apply...). */
+async function act(jid, action, { target, text } = {}) {
+  return call('/api/v1/whatsapp/act', { jid, action, target, text });
+}
+
 /** Publish a community post authored by the linked student. */
 async function postToCommunity(jid, text, anonymous = false) {
   return call('/api/v1/whatsapp/community-post', { jid, text, anonymous });
@@ -111,5 +116,6 @@ module.exports = {
   identify,
   context,
   lookup,
+  act,
   postToCommunity,
 };

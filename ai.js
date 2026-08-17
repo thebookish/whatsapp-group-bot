@@ -250,6 +250,102 @@ function formatCourseSlice(rows, start = 0, size = 5, head = "") {
  * not be told anything about anyone.
  */
 
+
+/**
+ * Actions that reach someone else — a job application an employer sees, a
+ * message that lands in a counselor's inbox — are staged for confirmation.
+ * Ticking off a milestone, saving a job or RSVPing only affects the student's
+ * own record and is reversible, so those run straight away.
+ */
+const CONFIRM_REQUIRED = new Set(["apply_job", "send_message"]);
+
+const ACTION_LABELS = {
+  complete_milestone: (a) => `mark "${a.target}" complete`,
+  rsvp_event: (a) => `RSVP you to "${a.target}"`,
+  save_job: (a) => `save "${a.target}"`,
+  apply_job: (a) => `apply you to "${a.target}"`,
+  send_message: (a) => `send this to your university:\n\n"${a.text}"`,
+};
+
+async function runStudentAction(jid, args) {
+  const action = args.action;
+
+  if (CONFIRM_REQUIRED.has(action)) {
+    stagePendingAction(jid, args);
+    const label = (ACTION_LABELS[action] || (() => action))(args);
+    return `⚠️ I'll ${label}\n\nReply *YES* to go ahead, or *CANCEL* to stop.`;
+  }
+
+  try {
+    const result = await uniportal.act(jid, action, args);
+    return describeActionResult(action, args, result);
+  } catch (err) {
+    console.error("student action failed:", action, err.message);
+    return `⚠️ ${err.message || "I couldn't do that."}`;
+  }
+}
+
+function describeActionResult(action, args, result) {
+  switch (action) {
+    case "complete_milestone":
+      return result?.alreadyDone
+        ? `✅ "${result.title}" was already complete.`
+        : `✅ Marked "${result?.title || args.target}" complete.`;
+    case "rsvp_event":
+      return `🎟️ You're going to "${result?.title || args.target}".`;
+    case "save_job":
+      return `🔖 Saved "${result?.title || args.target}".`;
+    case "apply_job":
+      return result?.alreadyApplied
+        ? `ℹ️ You had already applied to "${result.title}".`
+        : `📨 Applied to "${result?.title || args.target}".`;
+    case "send_message":
+      return "📤 Sent to your university.";
+    default:
+      return "✅ Done.";
+  }
+}
+
+/** Staged actions awaiting YES/CANCEL, alongside staged community posts. */
+const pendingActions = new Map();
+const PENDING_ACTION_TTL_MS = 10 * 60 * 1000;
+
+function stagePendingAction(jid, args) {
+  pendingActions.set(jid, { args, at: Date.now() });
+}
+
+function hasPendingAction(jid) {
+  const pending = pendingActions.get(jid);
+  if (!pending) return false;
+  if (Date.now() - pending.at > PENDING_ACTION_TTL_MS) {
+    pendingActions.delete(jid);
+    return false;
+  }
+  return true;
+}
+
+/** Settle a staged action. Returns a reply, or null if this was not an answer. */
+async function handlePendingAction(jid, text) {
+  if (!jid || !hasPendingAction(jid)) return null;
+  const answer = (text || "").trim().toLowerCase();
+
+  if (answer === "cancel" || answer === "no") {
+    pendingActions.delete(jid);
+    return "🚫 Cancelled — nothing was sent.";
+  }
+  if (answer !== "yes" && answer !== "confirm") return null;
+
+  const pending = pendingActions.get(jid);
+  pendingActions.delete(jid);
+  try {
+    const result = await uniportal.act(jid, pending.args.action, pending.args);
+    return describeActionResult(pending.args.action, pending.args, result);
+  } catch (err) {
+    console.error("confirmed action failed:", err.message);
+    return `⚠️ ${err.message || "That didn't go through."}`;
+  }
+}
+
 const LINK_REQUIRED_MESSAGE =
   "🔗 Connect your student account first — send: link your-university-email@example.ac.uk";
 
@@ -319,6 +415,12 @@ function formatLookup(result) {
     jobs: "💼 Job listings",
     accommodations: "🏠 Accommodation",
     journey: "🧭 Your journey",
+    documents: "📄 Your documents",
+    messages: "💬 Messages from your university",
+    notifications: "🔔 Unread alerts",
+    calendar: "🗓️ University calendar",
+    assessments: "📝 Assessments",
+    tasks: "✅ Your tasks",
   }[result.kind] || "Results";
 
   const lines = result.items.map((item) => {
@@ -333,6 +435,28 @@ function formatLookup(result) {
       const bits = [item.employer, item.location, item.pay].filter(Boolean).join(" · ");
       return `• *${item.title}*${bits ? ` — ${bits}` : ""}`;
     }
+    if (result.kind === "documents") {
+      const mark = item.status === "approved" ? "✅" : item.status === "rejected" ? "❌" : "🕐";
+      return `${mark} ${item.name} — ${item.status}${item.rejectionReason ? ` (${item.rejectionReason})` : ""}`;
+    }
+    if (result.kind === "messages") {
+      return `• *${item.from}* — ${item.message}${item.sentAt ? ` _(${item.sentAt})_` : ""}`;
+    }
+    if (result.kind === "notifications") {
+      return `🔔 *${item.title || "Alert"}* — ${item.message}${item.at ? ` _(${item.at})_` : ""}`;
+    }
+    if (result.kind === "calendar") {
+      return `• *${item.title}*${item.when ? ` — ${item.when}` : ""}${item.location ? ` @ ${item.location}` : ""}`;
+    }
+    if (result.kind === "assessments") {
+      const bits = [item.module, item.due ? `due ${item.due}` : null, item.weighting ? `${item.weighting}%` : null]
+        .filter(Boolean).join(" · ");
+      return `• *${item.title}*${bits ? ` — ${bits}` : ""}`;
+    }
+    if (result.kind === "tasks") {
+      const mark = item.status === "completed" ? "✅" : "⬜";
+      return `${mark} ${item.title}${item.due ? ` — due ${item.due}` : ""}`;
+    }
     const bits = [item.city, item.cost ? `£${item.cost}` : null].filter(Boolean).join(" · ");
     return `• *${item.title}*${bits ? ` — ${bits}` : ""}`;
   });
@@ -344,8 +468,11 @@ function buildSystemPrompt(accountContext) {
   const base =
     "You are a Student Assistant for WorldLynk. Use tools, not generic answers.\n" +
     "- Courses/universities → queryDataset\n" +
-    "- WorldLynk events, job listings, accommodation listings, or the student's journey " +
-    "tracker → lookupWorldlynk (this is WorldLynk's own data; prefer it)\n" +
+    "- Anything the student can see in the app — events, jobs, accommodation, their journey, " +
+    "documents (and which are still required), messages from their university, unread alerts, " +
+    "the university calendar, assessment deadlines, assigned tasks → lookupWorldlynk\n" +
+    "- Doing something for them — ticking off a milestone, RSVPing, saving or applying to a " +
+    "job, messaging their university → studentAction\n" +
     "- Wider UK rental market beyond WorldLynk listings → searchUKAccommodation\n" +
     "- Reminders → addReminder\n" +
     "- Meeting nearby students → handleConnectIntent\n" +
@@ -430,6 +557,8 @@ async function getAIResponse(userId, rawMessage, accountContext = null, jid = nu
     // before the model gets a chance to reinterpret a one-word reply.
     const postReply = await handlePendingPost(jid, messageText);
     if (postReply) return postReply;
+    const actionReply = await handlePendingAction(jid, messageText);
+    if (actionReply) return actionReply;
 
     // 👋 Greeting check
     if (/^(hello|hi|hey)\b/i.test(messageText)) {
@@ -514,16 +643,20 @@ async function getAIResponse(userId, rawMessage, accountContext = null, jid = nu
           function: {
             name: "lookupWorldlynk",
             description:
-              "Look up WorldLynk data for the signed-in student: upcoming events, job listings, " +
-              "accommodation listings, or their own journey tracker progress. Use this for any " +
-              "question about what events are on, what jobs or rooms are available, or how far " +
-              "through their journey they are.",
+              "Look up anything the student can see in the WorldLynk app: events, job " +
+              "listings, accommodation listings, their journey tracker, their documents and " +
+              "which are still required, messages from their university, unread alerts, the " +
+              "university calendar, their assessment deadlines, or tasks assigned to them.",
             parameters: {
               type: "object",
               properties: {
                 resource: {
                   type: "string",
-                  enum: ["events", "jobs", "accommodations", "journey"],
+                  enum: [
+                    "events", "jobs", "accommodations", "journey",
+                    "documents", "messages", "notifications", "calendar",
+                    "assessments", "tasks",
+                  ],
                 },
                 query: {
                   type: "string",
@@ -531,6 +664,31 @@ async function getAIResponse(userId, rawMessage, accountContext = null, jid = nu
                 },
               },
               required: ["resource"],
+            },
+          },
+        },
+        {
+          type: "function",
+          function: {
+            name: "studentAction",
+            description:
+              "Do something on the student's behalf: tick off a journey milestone, RSVP to an " +
+              "event, save or apply to a job, or message their university. Applying and " +
+              "messaging are confirmed with the student before they go through.",
+            parameters: {
+              type: "object",
+              properties: {
+                action: {
+                  type: "string",
+                  enum: ["complete_milestone", "rsvp_event", "save_job", "apply_job", "send_message"],
+                },
+                target: {
+                  type: "string",
+                  description: "Which milestone, event or job — its title is enough.",
+                },
+                text: { type: "string", description: "Message body, for send_message." },
+              },
+              required: ["action"],
             },
           },
         },
@@ -596,6 +754,10 @@ async function getAIResponse(userId, rawMessage, accountContext = null, jid = nu
               if (!jid) return LINK_REQUIRED_MESSAGE;
               const result = await uniportal.lookup(jid, args.resource, args.query);
               return formatLookup(result);
+            }
+            case "studentAction": {
+              if (!jid) return LINK_REQUIRED_MESSAGE;
+              return await runStudentAction(jid, args);
             }
             case "postToCommunity": {
               if (!jid) return LINK_REQUIRED_MESSAGE;
