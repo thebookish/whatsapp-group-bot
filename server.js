@@ -140,13 +140,59 @@ app.post('/api/send', async (req, res) => {
     return res.status(503).json({ ok: false, error: 'whatsapp not connected' });
   }
   try {
-    await sock.sendMessage(normalizeJid(jid), { text: String(text) });
-    res.json({ ok: true });
+    const target = normalizeJid(jid);
+    const sent = await sock.sendMessage(target, { text: String(text) });
+    const messageId = sent?.key?.id ?? null;
+
+    // Remember counselor messages so that when the student uses WhatsApp's
+    // reply function on one, we route their answer back to the counselor
+    // instead of handing it to the assistant.
+    if (req.body?.kind === 'counselor_message' && messageId) {
+      rememberCounselorMessage(target, messageId);
+    }
+    res.json({ ok: true, messageId });
   } catch (err) {
     console.error('❌ /api/send failed:', err.message);
     res.status(502).json({ ok: false, error: err.message });
   }
 });
+
+
+/* ============================
+   Counselor message threading
+   WhatsApp gives a quoted reply the id of the message being answered, so a
+   student replying to a counselor's message can be recognised exactly —
+   no guessing from timing, and no hijacking of unrelated questions.
+============================= */
+const counselorMessages = new Map(); // jid -> Map(messageId -> sentAt)
+const COUNSELOR_REPLY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+function rememberCounselorMessage(jid, messageId) {
+  if (!counselorMessages.has(jid)) counselorMessages.set(jid, new Map());
+  counselorMessages.get(jid).set(messageId, Date.now());
+}
+
+function isReplyToCounselor(jid, quotedId) {
+  if (!quotedId) return false;
+  const forJid = counselorMessages.get(jid);
+  if (!forJid) return false;
+  const at = forJid.get(quotedId);
+  if (!at) return false;
+  if (Date.now() - at > COUNSELOR_REPLY_WINDOW_MS) {
+    forJid.delete(quotedId);
+    return false;
+  }
+  return true;
+}
+
+/** The id of the message this one quotes, if any. */
+function quotedMessageId(msg) {
+  const ctx =
+    msg?.message?.extendedTextMessage?.contextInfo ||
+    msg?.message?.imageMessage?.contextInfo ||
+    msg?.message?.videoMessage?.contextInfo;
+  return ctx?.stanzaId ?? null;
+}
 
 /* ============================
    Notification REST API
@@ -678,6 +724,12 @@ function startBackgroundTimers() {
     for (const [jid, at] of awaitingCode.entries()) {
       if (now - at > AWAITING_CODE_TTL) awaitingCode.delete(jid);
     }
+    for (const [jid, ids] of counselorMessages.entries()) {
+      for (const [id, at] of ids.entries()) {
+        if (now - at > COUNSELOR_REPLY_WINDOW_MS) ids.delete(id);
+      }
+      if (ids.size === 0) counselorMessages.delete(jid);
+    }
   }, 5 * 60 * 1000);
 }
 
@@ -736,6 +788,22 @@ async function onMessages({ messages }) {
         text = text.replace(/reply\s+me\s+privately|dm\s+me|private\s+reply/gi, '').trim();
       }
     } else {
+      // A quoted reply to a counselor's message belongs in that conversation,
+      // not in the assistant's. Checked before anything else so a plain "yes"
+      // or "thanks" reaches the counselor rather than being interpreted.
+      if (text && isReplyToCounselor(senderId, quotedMessageId(msg))) {
+        try {
+          await uniportal.act(senderId, 'send_message', { text });
+          await sock.sendMessage(senderId, { text: '📤 Sent to your university.' });
+        } catch (err) {
+          console.error('counselor reply failed:', err.message);
+          await sock.sendMessage(senderId, {
+            text: "⚠️ I couldn't pass that on. Please try again shortly.",
+          });
+        }
+        return;
+      }
+
       // Account linking is a private-chat flow only: a code sent into a group
       // would be readable by everyone in it.
       const linkReply = await handleLinking(senderId, text);
