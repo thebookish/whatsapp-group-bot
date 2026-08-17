@@ -95,7 +95,8 @@ async function context(jid) {
 
 /** Read-only lookup of WorldLynk data on behalf of a linked student. */
 async function lookup(jid, resource, query) {
-  return call('/api/v1/whatsapp/lookup', { jid, resource, query });
+  // jid is omitted for public resources — the server allows those unlinked.
+  return call('/api/v1/whatsapp/lookup', { jid: jid || undefined, resource, query });
 }
 
 /** Take an action as the linked student (complete milestone, RSVP, apply...). */

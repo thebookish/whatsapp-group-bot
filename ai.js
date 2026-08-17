@@ -346,6 +346,9 @@ async function handlePendingAction(jid, text) {
   }
 }
 
+/** Answerable without a linked account — mirrors the server's own list. */
+const PUBLIC_RESOURCES = new Set(["universities", "courses", "jobs", "accommodations"]);
+
 const LINK_REQUIRED_MESSAGE =
   "🔗 Connect your student account first — send: link your-university-email@example.ac.uk";
 
@@ -415,6 +418,8 @@ function formatLookup(result) {
     jobs: "💼 Job listings",
     accommodations: "🏠 Accommodation",
     journey: "🧭 Your journey",
+    universities: "🎓 Universities",
+    courses: "📚 Courses",
     documents: "📄 Your documents",
     messages: "💬 Messages from your university",
     notifications: "🔔 Unread alerts",
@@ -429,11 +434,19 @@ function formatLookup(result) {
       return `${mark} ${item.title}`;
     }
     if (result.kind === "events") {
-      return `• *${item.title}*${item.when ? ` — ${item.when}` : ""}${item.location ? ` @ ${item.location}` : ""}`;
+      const bits = [item.when, item.location, item.category, item.price].filter(Boolean).join(" · ");
+      return `• *${item.title}*${bits ? `\n   ${bits}` : ""}`;
     }
     if (result.kind === "jobs") {
       const bits = [item.employer, item.location, item.pay].filter(Boolean).join(" · ");
       return `• *${item.title}*${bits ? ` — ${bits}` : ""}`;
+    }
+    if (result.kind === "universities") {
+      return `• *${item.name}*${item.city ? ` — ${item.city}` : ""}`;
+    }
+    if (result.kind === "courses") {
+      const bits = [item.level, item.duration, item.tuition].filter(Boolean).join(" · ");
+      return `• *${item.name}*${bits ? ` — ${bits}` : ""}`;
     }
     if (result.kind === "documents") {
       const mark = item.status === "approved" ? "✅" : item.status === "rejected" ? "❌" : "🕐";
@@ -484,9 +497,11 @@ function buildSystemPrompt(accountContext) {
   if (!accountContext) {
     return (
       base +
-      " The person you are talking to has NOT linked their student account, so you know " +
-      "nothing about them. If they ask about their application, documents, tasks or " +
-      "university records, tell them to send: link their-university-email@example.ac.uk"
+      " The person you are talking to has NOT linked a student account, so you know nothing " +
+      "about them personally. You CAN still help with public WorldLynk information — " +
+      "universities, their courses, job listings and accommodation — via lookupWorldlynk. " +
+      "Only if they ask about their OWN application, documents, messages, deadlines or " +
+      "journey, tell them to send: link their-university-email@example.ac.uk"
     );
   }
 
@@ -643,7 +658,9 @@ async function getAIResponse(userId, rawMessage, accountContext = null, jid = nu
           function: {
             name: "lookupWorldlynk",
             description:
-              "Look up anything the student can see in the WorldLynk app: events, job " +
+              "Look up WorldLynk information. Available to anyone, linked or not: " +
+              "universities, their courses, job listings and accommodation listings. " +
+              "Available once their account is linked: events, job " +
               "listings, accommodation listings, their journey tracker, their documents and " +
               "which are still required, messages from their university, unread alerts, the " +
               "university calendar, their assessment deadlines, or tasks assigned to them.",
@@ -653,6 +670,7 @@ async function getAIResponse(userId, rawMessage, accountContext = null, jid = nu
                 resource: {
                   type: "string",
                   enum: [
+                    "universities", "courses",
                     "events", "jobs", "accommodations", "journey",
                     "documents", "messages", "notifications", "calendar",
                     "assessments", "tasks",
@@ -751,9 +769,16 @@ async function getAIResponse(userId, rawMessage, accountContext = null, jid = nu
               return await handleConnectIntent({ requesterId: uid, ...args });
             }
             case "lookupWorldlynk": {
-              if (!jid) return LINK_REQUIRED_MESSAGE;
-              const result = await uniportal.lookup(jid, args.resource, args.query);
-              return formatLookup(result);
+              // Public resources are answerable for anyone; only personal ones
+              // need a linked account, and the server enforces that too.
+              if (!jid && !PUBLIC_RESOURCES.has(args.resource)) return LINK_REQUIRED_MESSAGE;
+              try {
+                const result = await uniportal.lookup(jid || undefined, args.resource, args.query);
+                return formatLookup(result);
+              } catch (err) {
+                if (err.status === 403) return LINK_REQUIRED_MESSAGE;
+                throw err;
+              }
             }
             case "studentAction": {
               if (!jid) return LINK_REQUIRED_MESSAGE;
